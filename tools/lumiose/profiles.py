@@ -155,8 +155,12 @@ def prepare_profile_directory(root: Path, profile: dict) -> Path:
     if save_path != (root / 'save').resolve() and not target_sdcard.exists():
         if os.name == 'nt':
             # Use an NTFS directory junction so mod assets/updates stay shared without admin rights.
+            # Convert forward slashes (e.g. under MSYS2 Python) to backslashes so cmd/mklink
+            # never interprets '/a/...' as an option switch.
+            win_target = str(target_sdcard).replace('/', '\\')
+            win_shared = str(shared_sdcard).replace('/', '\\')
             res = subprocess.run(
-                ['cmd', '/c', 'mklink', '/J', str(target_sdcard), str(shared_sdcard)],
+                ['cmd', '/c', 'mklink', '/J', win_target, win_shared],
                 capture_output=True,
                 text=True,
             )

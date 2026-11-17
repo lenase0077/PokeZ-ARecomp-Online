@@ -18,20 +18,19 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          pacboy: >-
-            clang:p
-            lld:p
-            make:p
-            SDL3:p
-            ffmpeg:p
-            shaderc:p
-            vulkan-headers:p
-            vulkan-loader:p
           install: >-
             git
+            make
             unzip
             curl
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-lld
             mingw-w64-ucrt-x86_64-binutils
+            mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-ffmpeg
+            mingw-w64-ucrt-x86_64-vulkan-devel
+            mingw-w64-ucrt-x86_64-shaderc
+            mingw-w64-ucrt-x86_64-vulkan-memory-allocator
             mingw-w64-ucrt-x86_64-python
 
       - name: Build lasrecomp.exe (Hexveil404 v0.1.25 optimizations + Lumiose)

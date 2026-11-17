@@ -1,0 +1,93 @@
+name: Windows Private Build (v0.1.25 Optimizations + Lumiose Private Server)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          pacboy: >-
+            clang:p
+            lld:p
+            make:p
+            SDL3:p
+            ffmpeg:p
+            shaderc:p
+            vulkan-headers:p
+            vulkan-loader:p
+          install: >-
+            git
+            unzip
+            curl
+            mingw-w64-ucrt-x86_64-binutils
+            mingw-w64-ucrt-x86_64-python
+
+      - name: Build lasrecomp.exe (Hexveil404 v0.1.25 optimizations + Lumiose)
+        run: |
+          make -j"$(nproc)" RELEASE=1 GENOPT="-O1 -DGUEST_VOLATILE" GENARCH="-march=x86-64-v3" build/lasrecomp.exe
+          test -f build/lasrecomp.exe
+          test -f build/lasrecomp.dll.a
+
+      - name: Fetch Zig 0.17.0, build zig-slim, compile winmm.dll, and run unit tests
+        run: |
+          bash tools/fetch_zig.sh
+          FLAGS=$(make -s --eval='pv: ; @echo $(strip $(filter-out -Iruntime,$(GENFLAGS)))' GENOPT="-O1 -DGUEST_VOLATILE" GENARCH="-march=x86-64-v3" pv)
+          bash tools/zig_slim.sh $FLAGS
+          export LUMIOSE_ZIG_DIR="$PWD/build/zig-slim"
+          python3 tools/lumiose/build_redirect_winmm.py "$PWD/winmm.dll"
+          test -f "$PWD/winmm.dll"
+          pushd tools/lumiose >/dev/null
+          LARECOMP_REQUIRE_WINMM=1 python3 -m unittest test_private_server.py test_entry.py -v
+          popd >/dev/null
+
+      - name: Package Windows Patch Bundle
+        run: |
+          DIST="build/Lumiose-Private-Patch-windows"
+          rm -rf "$DIST"
+          mkdir -p "$DIST/tools/lumiose" "$DIST/gamelib-src" "$DIST/lumiose"
+          cp build/lasrecomp.exe build/lasrecomp.dll.a winmm.dll "$DIST/"
+          cp "Start Private Server Only.bat" PRIVATE-SERVER-README.md "$DIST/"
+          cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt "$DIST/gamelib-src/"
+          cp tools/lumiose/private_server.py \
+             tools/lumiose/profiles.py \
+             tools/lumiose/invite_code.py \
+             tools/lumiose/entry.py \
+             tools/lumiose/redirect_winmm.c \
+             tools/lumiose/build_redirect_winmm.py \
+             tools/lumiose/test_private_server.py \
+             "$DIST/tools/lumiose/"
+
+          # Copy non-Windows MSYS2 UCRT64 runtime DLLs required by lasrecomp.exe (excluding vulkan-1.dll)
+          ldd build/lasrecomp.exe | awk 'tolower($3) !~ /^\/c\/windows\// && $3 ~ /^\// && !/vulkan-1/ {print $3}' | sort -u |
+            while read -r dll; do cp -v "$dll" "$DIST/"; done
+
+          # Fetch signed AMD FidelityFX SDK v2.4.0 FSR 3.1 runtime DLLs
+          mkdir -p build/ext/ffx
+          for p in "amd_fidelityfx_loader_vk.dll 38a56a01fb3565c0757d9f5c1e4e69de4b65e5f2e5769b323b200dc1f142bab9" \
+                   "amd_fidelityfx_upscaler_vk.dll 4a7e895af6e0b615d40a84d59eb8c2b1054ad91cdd0c739567940270d51bdab7"; do
+            set -- $p
+            curl -fL --proto '=https' -o "build/ext/ffx/$1" \
+              "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v2.4.0/Kits/FidelityFX/signedbin/$1"
+            echo "$2 *build/ext/ffx/$1" | sha256sum -c --quiet
+            cp "build/ext/ffx/$1" "$DIST/"
+          done
+          cp third_party/ffx_api/LICENSE.md "$DIST/AMD-FSR-LICENSE.md"
+          ls -la "$DIST"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Lumiose-Private-Patch-windows
+          path: build/Lumiose-Private-Patch-windows
+          if-no-files-found: error

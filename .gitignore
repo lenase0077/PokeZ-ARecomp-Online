@@ -40,5 +40,23 @@ __pycache__/
 /lumiose/update-state.json
 /lumiose/update.lock
 /lumiose/config.json
+/lumiose/private-server.json
+/lumiose/profiles.json
+# User game ROMs, keys, logs, screenshots, and local compiled binaries
+/ZA/
+*.nsp
+*.xci
+*.nca
+*.keys
+prod.keys
+title.keys
+/winmm.dll
+/lasrecomp.exe
+/lasrecomp.dll.a
+/lasgame.dll
+/lasgame.dll.id
+/room-code.txt
+/logs/
+*.log
 # Claude Code: machine-specific notes
 CLAUDE.local.md

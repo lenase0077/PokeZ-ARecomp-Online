@@ -12,9 +12,15 @@ typedef int SOCKET;
 #define closesocket close
 #define ioctlsocket ioctl
 #endif
+#ifndef _WIN32
+#include <netdb.h>
+#endif
 #include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "../hle.h"
 #include "../lumiose_native_profile.h"
 
@@ -23,6 +29,10 @@ static SOCKET sockets[LUMIOSE_MAX_SOCKETS];
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int started;
 static _Atomic bool trainer_name_ready;
+static bool g_override_active;
+static struct sockaddr_in g_override_addr;
+static struct in_addr g_expected_addr;
+static uint16_t g_expected_port_be;
 
 // Called after Lumiose reads the actual name from a loaded trainer save.
 void lumiose_mark_trainer_ready(void) { atomic_store(&trainer_name_ready, true); }
@@ -55,6 +65,7 @@ RT_ON_RESET(lumiose_net_reset) {
 #endif
         started = 0;
     }
+    g_override_active = false;
     pthread_mutex_unlock(&lock);
 }
 
@@ -116,6 +127,39 @@ static bool read_address(uint64_t guest, uint64_t size, struct sockaddr_in *out)
     return true;
 }
 
+static bool resolve_server_override(const struct sockaddr_in *expected) {
+    const char *spec = getenv("LUMIOSE_SERVER_OVERRIDE");
+    if (!spec || !*spec) return false;
+
+    const char *colon = strrchr(spec, ':');
+    if (!colon || colon == spec || !*(colon + 1)) return false;
+
+    char host[256];
+    size_t hlen = (size_t)(colon - spec);
+    if (hlen >= sizeof(host)) return false;
+    memcpy(host, spec, hlen);
+    host[hlen] = '\0';
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%s", colon + 1);
+
+    struct addrinfo hints = {0};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res || res->ai_addrlen < sizeof(g_override_addr)) {
+        if (res) freeaddrinfo(res);
+        return false;
+    }
+    memcpy(&g_override_addr, res->ai_addr, sizeof(g_override_addr));
+    freeaddrinfo(res);
+    g_expected_addr = expected->sin_addr;
+    g_expected_port_be = expected->sin_port;
+    g_override_active = true;
+    return true;
+}
+
 HLE_FUNC("_ZN2nn6socket6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj", lumiose_socket_send) {
     int fd = (int)c->x[0], result = -1;
     static int logged;
@@ -129,13 +173,14 @@ HLE_FUNC("_ZN2nn6socket6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj", lumiose_soc
             return;
         }
     }
+
     if (c->x[2] <= INT_MAX && read_address(c->x[4], c->x[5], &address)) {
+        const unsigned char *ip = (const unsigned char *)&address.sin_addr;
+        char endpoint[64];
+        snprintf(endpoint, sizeof endpoint, "%u.%u.%u.%u:%u", ip[0], ip[1], ip[2], ip[3],
+                 (unsigned)ntohs(address.sin_port));
         const char *allow = getenv("LUMIOSE_TEST_SERVER");
         if (allow && *allow) {
-            const unsigned char *ip = (const unsigned char *)&address.sin_addr;
-            char endpoint[64];
-            snprintf(endpoint, sizeof endpoint, "%u.%u.%u.%u:%u", ip[0], ip[1], ip[2], ip[3],
-                     (unsigned)ntohs(address.sin_port));
             if (strcmp(endpoint, allow)) {
                 LOG("[lumiose net] test blocked an unexpected destination\n");
                 c->x[0] = (uint32_t)-1;
@@ -146,16 +191,22 @@ HLE_FUNC("_ZN2nn6socket6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj", lumiose_soc
         FILE *drop = drop_file && *drop_file ? fopen(drop_file, "rb") : NULL;
         if (drop) fclose(drop);
         if (getenv("LUMIOSE_TEST_OFFLINE_CAPTURE") || drop) {
-            const unsigned char *ip = (const unsigned char *)&address.sin_addr;
-            LOG("[lumiose net] offline capture to %u.%u.%u.%u:%u, %llu bytes (not sent)\n",
-                ip[0], ip[1], ip[2], ip[3], (unsigned)ntohs(address.sin_port), (unsigned long long)c->x[2]);
+            LOG("[lumiose net] offline capture to %s, %llu bytes (not sent)\n",
+                endpoint, (unsigned long long)c->x[2]);
             c->x[0] = (uint32_t)c->x[2];
             return;
         }
         pthread_mutex_lock(&lock);
-        if (started && fd >= 0 && fd < LUMIOSE_MAX_SOCKETS && sockets[fd] != INVALID_SOCKET)
+        if (started && fd >= 0 && fd < LUMIOSE_MAX_SOCKETS && sockets[fd] != INVALID_SOCKET) {
+            struct sockaddr_in dst = address;
+            if ((!g_override_active && resolve_server_override(&address)) ||
+                (g_override_active && address.sin_addr.s_addr == g_expected_addr.s_addr &&
+                 address.sin_port == g_expected_port_be)) {
+                dst = g_override_addr;
+            }
             result = sendto(sockets[fd], (const char *)(uintptr_t)c->x[1], (int)c->x[2], 0,
-                            (struct sockaddr *)&address, sizeof address);
+                            (struct sockaddr *)&dst, sizeof dst);
+        }
         pthread_mutex_unlock(&lock);
     }
     if (logged++ < 10) LOG("[lumiose net] send %s, %llu bytes%s\n", result < 0 ? "failed" : "ok",
@@ -178,6 +229,15 @@ HLE_FUNC("_ZN2nn6socket8RecvFromEiPvmNS0_7MsgFlagEPNS0_8SockAddrEPj", lumiose_so
         if (started && fd >= 0 && fd < LUMIOSE_MAX_SOCKETS && sockets[fd] != INVALID_SOCKET)
             result = recvfrom(sockets[fd], (char *)(uintptr_t)c->x[1], (int)c->x[2], 0,
                               (struct sockaddr *)&address, &size);
+        pthread_mutex_unlock(&lock);
+    }
+    if (result >= 0) {
+        pthread_mutex_lock(&lock);
+        if (g_override_active && address.sin_addr.s_addr == g_override_addr.sin_addr.s_addr &&
+            address.sin_port == g_override_addr.sin_port) {
+            address.sin_addr = g_expected_addr;
+            address.sin_port = g_expected_port_be;
+        }
         pthread_mutex_unlock(&lock);
     }
     if (result >= 0 && c->x[4] && c->x[5] && *(uint32_t *)(uintptr_t)c->x[5] >= 16) {

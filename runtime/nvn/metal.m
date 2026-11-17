@@ -1,7 +1,6 @@
 #include <sys/mman.h>
 #include "paths.h"
 #include "settings.h"
-#include "input_bind.h"
 #include "ui/menu.h"
 // Metal renderer for the NVN layer: window, textures, command execution, presentation.
 #include <sys/stat.h>
@@ -1284,7 +1283,7 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
         extern void widescreen_frame_end(uint64_t frame);
         widescreen_frame_end(frame);
         extern void widescreen_set_factor(float f);
-        extern bool widescreen_allowed(void);
+        extern bool widescreen_allowed_for(double w, double h);
         // render scale + placement in the window: runtime/nvn/output_scale.c (Video tab "Internal resolution")
         // GPU busy time since the last frame (renderer.m renderer_gpu_busy: the union of the command buffers' spans): the
         // game's command buffers and the window image's (LARECOMP_DYNRES_COUNT_PRESENT=0: the game's only, as before)
@@ -1302,7 +1301,7 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
             renderer_gpu_busy(done, true);
         }];
         OutScale os;
-        output_scale(dw, dh, widescreen_allowed(), SDL_GetTicksNS() / 1e9, game_ms, win_ms, &os);
+        output_scale(dw, dh, widescreen_allowed_for(dw, dh), SDL_GetTicksNS() / 1e9, game_ms, win_ms, &os);
         double sx = os.sx, sy = os.sy, vx = os.vx, vy = os.vy, vw = os.vw, vh = os.vh, shape = os.shape;
         // interiors / dungeons: their 16:9 centre, or the part inside a room wider than one screen
         extern void widescreen_present_crop(uint64_t, double, float *, double *, double *, double *, double *);
@@ -1363,7 +1362,6 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
         static long menu_at = -1;  // test hook: open the menu at this frame (LARECOMP_MENU_AT)
         if (menu_at < 0) menu_at = getenv("LARECOMP_MENU_AT") ? atol(getenv("LARECOMP_MENU_AT")) : 0;
         if (menu_at && (long)frame + 1 == menu_at) { extern void menu_test_open(void); menu_test_open(); }
-        menu_set_game_viewport((float)vx, (float)vy, (float)vw, (float)vh);
         menu_render(dev, cb, drawable.texture);
         static long win_shot = -1;  // LARECOMP_WINDOW_SHOT=<frame>: save the final window image (game + menu)
         if (win_shot < 0) win_shot = getenv("LARECOMP_WINDOW_SHOT") ? atol(getenv("LARECOMP_WINDOW_SHOT")) : 0;
@@ -1631,9 +1629,8 @@ int ui_run(void) {
         SDL_Event e;
         while (SDL_WaitEventTimeout(&e, 16)) {
             input_rumble_poll();
-            if (e.type == SDL_EVENT_QUIT) { input_rumble_stop(); input_led_stop(); LOG("window closed\n"); backend_quit(); exit(0); }
+            if (e.type == SDL_EVENT_QUIT) { input_rumble_stop(); input_led_stop(); LOG("window closed\n"); backend_quit(); extern void bugrec_finish(void); bugrec_finish(); exit(0); }
             if (input_user_blocked(&e)) continue;  // scripted test runs: the real keyboard / mouse / pads do nothing
-            input_note_prompt_event(&e);
             input_cursor_event(&e);
             if (menu_handle_event(&e)) continue;
             input_handle_event(&e);

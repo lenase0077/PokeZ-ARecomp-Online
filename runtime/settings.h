@@ -32,7 +32,7 @@ extern unsigned g_gpu_vendor;
 extern bool g_gpu_dozen;  // (vulkan/device.c) the device is Dozen: DirectX 12 underneath
 bool gpu_feature_on(int feature, const char *env);
 enum { GPU_AUTO = 0, GPU_ON = 1, GPU_OFF = 2 };
-enum { TAA_GAME = 0, TAA_FSR2 = 1, TAA_DLAA = 2, TAA_FSR3 = 3 };  // (Settings.taa; append to preserve saved values)
+enum { TAA_GAME = 0, TAA_FSR2 = 1, TAA_DLAA = 2, TAA_FSR3 = 3, TAA_FSR4 = 4 };  // (Settings.taa; append to preserve saved values)
 enum { TIMER_POS_LEFT = 0, TIMER_POS_RIGHT = 1 };  // the run timer's corner (bottom left / right)
 enum { CHAOS_LETTERS_OFF = 0, CHAOS_LETTERS_EXPLORED = 1, CHAOS_LETTERS_MAP = 2 /* explored, all with the Map */ };
 // System language served to the game (runtime/services/am.c GetDesiredLanguage, services/hid_set.c GetLanguageCode):
@@ -44,6 +44,7 @@ extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto"
 
 typedef struct {
     int aspect;          // ASPECT_*: unlocked = fill the window (wider/taller views), original = 16:9 with bars
+    int hud_width;       // Pokémon Z-A wider than 16:9: % of the extra width the HUD's sides move out by (0: the 16:9 box)
     bool fullscreen;
     int res_mode;        // RES_MATCH, 1..4 (N x the Switch's 1080p), RES_DYNAMIC, RES_Q75/50/25 (share of the display)
     bool res_auto;       // never chosen: the default for this GPU (settings_resolve_defaults); saved as "auto"

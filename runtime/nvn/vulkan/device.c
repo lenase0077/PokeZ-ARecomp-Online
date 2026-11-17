@@ -9,12 +9,11 @@
 #include <unistd.h>
 
 #include "../../paths.h"
-#include "../../input_bind.h"
-#include "../../hle/za_mouse_drag.h"
 #include "../../platform.h"
 #include "../../rt.h"  // (HEAP_MAX: lazy_heap_predicted)
 #include "../../settings.h"
 #include "../../ui/menu.h"
+#include "../../hle/za_mouse_drag.h"
 #include "../rqueue.h"
 #include "vk.h"
 #include "record.h"
@@ -257,6 +256,8 @@ static void pick_device(void) {
     VkPhysicalDevice *pd = calloc(n, sizeof *pd);
     vkEnumeratePhysicalDevices(g_vk.inst, &n, pd);
     int want = ENV("LARECOMP_GPU") ? atoi(ENV("LARECOMP_GPU")) : -1, best = -1, best_score = -1;
+    uint32_t best_api = 0, best_drv = 0;
+    bool twin = false;  // (two equally ranked GPUs - the same one through two drivers: see below)
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(pd[i], &p);
@@ -268,9 +269,16 @@ static void pick_device(void) {
         if (p.apiVersion >= VK_API_VERSION_1_3) score++;
         if (g_settings.gpu_name[0] && !strcmp(p.deviceName, g_settings.gpu_name)) score = 50;
         if ((int)i == want) score = 100;
-        if (score > best_score) { best_score = score; best = (int)i; }
+        // The same GPU twice, through two drivers (#288: a laptop's RX 5600M listed by its maker's old AMD driver, Vulkan
+        // 1.3.212, and by AMD's current one, 1.4.315): the first listed was taken - the old one, whose shader compiler
+        // crashed on every pipeline, so nothing was drawn. Equal scores go to the newer Vulkan, then the newer driver.
+        bool newer = score == best_score && (p.apiVersion > best_api || (p.apiVersion == best_api && p.driverVersion > best_drv));
+        if (score == best_score && best >= 0) twin = true;
+        if (score > best_score || newer) { best_score = score; best = (int)i; best_api = p.apiVersion; best_drv = p.driverVersion; }
     }
     if (best < 0) FATAL("no Vulkan 1.2 device: the GPU driver is too old, or the GPU has no Vulkan 1.2 driver\n");
+    if (twin) LOG("[vk] gpu %d chosen: of the equally ranked ones, the newest Vulkan / driver (api %u.%u.%u)\n", best,
+                  VK_API_VERSION_MAJOR(best_api), VK_API_VERSION_MINOR(best_api), VK_API_VERSION_PATCH(best_api));
     g_vk.phys = pd[best];
     free(pd);
     vkGetPhysicalDeviceProperties(g_vk.phys, &g_vk.props);
@@ -576,13 +584,26 @@ static _Atomic int nbad_sh;
 static pthread_mutex_t bad_sh_lock = PTHREAD_MUTEX_INITIALIZER;
 static void bad_shaders_load(void) {
     FILE *f = fopen(BAD_SHADERS_FILE, "r");
-    if (!f) return;
     unsigned drv;
     unsigned long long v, s;
     int n = 0;
-    while (n < BAD_SHADERS_MAX && fscanf(f, "%u %llx %llx", &drv, &v, &s) == 3)
+    while (f && n < BAD_SHADERS_MAX && fscanf(f, "%u %llx %llx", &drv, &v, &s) == 3)
         if (drv == g_vk.props.driverVersion) bad_sh[n].vs = v, bad_sh[n++].fs = s;
-    fclose(f);
+    if (f) fclose(f);
+    // Known to every driver so far on NVIDIA's RTX 50 cards (Blackwell, device ids from 0x2b00): Houndoom's Snarl
+    // particle - the compiler crashed on it (#93, RTX 5060 Ti, Windows), the GPU ran an invalid instruction (#180, RTX
+    // 5060 Ti) or never finished the submission (#284, RTX 5080, Linux 620.70.06: skipped by hand, Snarl played without a
+    // hang twice and looked the same as on a Steam Deck). Ada and older, AMD and Intel build and run it fine. Skipped on
+    // those cards from the start, whatever the driver; LARECOMP_VK_SNARL_SKIP=0 builds it, =1 skips it on any GPU.
+    const char *e = getenv("LARECOMP_VK_SNARL_SKIP");
+    bool rtx50 = g_vk.props.vendorID == 0x10de && g_vk.props.deviceID >= 0x2b00;
+    if ((e && *e ? atoi(e) != 0 : rtx50) && n < BAD_SHADERS_MAX) {
+        bool have = false;
+        for (int i = 0; i < n; i++) have |= bad_sh[i].vs == 0x3ed672471eddbfd1ull && bad_sh[i].fs == 0xf830589dced6fa18ull;
+        if (!have) bad_sh[n].vs = 0x3ed672471eddbfd1ull, bad_sh[n++].fs = 0xf830589dced6fa18ull;
+        LOG("[vk] Snarl's particle pipeline skipped (vs 3ed672471eddbfd1 fs f830589dced6fa18: RTX 50 drivers hang or "
+            "crash on it, #284; LARECOMP_VK_SNARL_SKIP=0 builds it)\n");
+    }
     nbad_sh = n;
     if (n) LOG("[vk] %d pipeline(s) skipped: this driver's compiler crashes on them, or gave the GPU bad code near them (%s)\n", n,
                BAD_SHADERS_FILE);
@@ -650,12 +671,17 @@ bool vk_compile_crash_recover(uint64_t pc, const char *what, uint64_t fa) {
     extern const char *plat_symbol(uint64_t pc, uint64_t *offset);
     uint64_t off = 0;
     const char *m = plat_symbol(pc, &off);
-    LOG("[vk] %s accessing %#llx at %s+%llx, on a build worker: the game goes on\n", what, (unsigned long long)fa, m ? m : "?",
-        (unsigned long long)off);
     int was = rt_gpu_bad_code;
     vk_compile_crash_note();
+    if (!vk_compile_abandon()) {  // (not a build thread: the crash report follows, the pipeline listed for the next start)
+        LOG("[vk] %s accessing %#llx at %s+%llx, not on a build thread: the game can't go on\n", what,
+            (unsigned long long)fa, m ? m : "?", (unsigned long long)off);
+        return false;
+    }
     rt_gpu_bad_code = was;  // (no dialog comes: a later, unrelated crash mustn't read as this one)
-    return vk_compile_abandon();
+    LOG("[vk] %s accessing %#llx at %s+%llx, on a build thread: the game goes on\n", what, (unsigned long long)fa,
+        m ? m : "?", (unsigned long long)off);
+    return true;
 }
 
 void vk_device_fault_report(void) {
@@ -742,7 +768,7 @@ static void create_device(void) {
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[32];
+    const char *ext[40];
     uint32_t n_ext = 0;
     // Vulkan 1.2: the 1.3 features the driver has as extensions. LARECOMP_VK_COMPAT=1 takes none of them (the compat.c
     // ways), =<names> only leaves out those: rendering, sync, eds, eds2 (e.g. =sync)
@@ -752,9 +778,36 @@ static void create_device(void) {
     bool v13 = g_vkc.api >= VK_API_VERSION_1_3;
     bool x_dr = !v13 && !VK_OFF("rendering") && has_ext(ep, ne, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
     bool x_s2 = !v13 && !VK_OFF("sync") && has_ext(ep, ne, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
-    bool x_ds = !v13 && !(VK_OFF("eds") && !strstr(cm, "eds2")) && has_ext(ep, ne, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+    // Extended dynamic state 1 is core in Vulkan 1.3, but RADV 27 initializes its PS epilog cache only when the
+    // extension's feature bit is enabled (radv_device.c: ps_epilogs). Without it, the first draw of a fragment shader
+    // with an epilog crashes in radv_shader_part_cache_get (Mesa 27.0-devel, GFX1201). Enabling the promoted extension
+    // on a 1.3 device is legal and sets that bit; the commands stay the core ones below. Only RADV needs it, so other
+    // 1.3 drivers keep their previous feature chain.
+    bool radv = strstr(g_vk.props.deviceName, "RADV") != NULL;
+    bool x_ds = !(VK_OFF("eds") && !strstr(cm, "eds2")) && has_ext(ep, ne, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME) &&
+                (!v13 || radv);
     bool x_ds2 = !v13 && !VK_OFF("eds2") && has_ext(ep, ne, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
 #undef VK_OFF
+    bool fsr4_req = vk_fsr4_wanted();
+#ifdef VK_KHR_cooperative_matrix
+    bool fsr4_cm_ext = has_ext(ep, ne, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+#else
+    bool fsr4_cm_ext = false;
+#endif
+#ifdef VK_EXT_shader_float8
+    bool fsr4_f8_ext = has_ext(ep, ne, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+#else
+    bool fsr4_f8_ext = false;
+#endif
+#ifdef VK_KHR_compute_shader_derivatives
+    bool fsr4_cd_ext = has_ext(ep, ne, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+#else
+    bool fsr4_cd_ext = false;
+#endif
+    bool fsr4_cd_quads = false, fsr4_cd_linear = false;
+    if (fsr4_req && fsr4_cm_ext) ext[n_ext++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
+    if (fsr4_req && fsr4_f8_ext) ext[n_ext++] = VK_EXT_SHADER_FLOAT8_EXTENSION_NAME;
+    if (fsr4_req && fsr4_cd_ext) ext[n_ext++] = VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME;
     if (x_dr) ext[n_ext++] = VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME;
     if (x_s2) ext[n_ext++] = VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME;
     if (x_ds) ext[n_ext++] = VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME;
@@ -832,7 +885,7 @@ static void create_device(void) {
     // Whether the window really shows the frames presented (present_watch). LARECOMP_NO_PRESENT_WATCH=1: not checked
     bool x_pw = !ENV("LARECOMP_NO_PRESENT_WATCH") && has_ext(ep, ne, VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
                 has_ext(ep, ne, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
-    vk_dlaa_device_exts(ep, ne, ext, &n_ext, 28);  // (DLAA: what NGX needs; room left for the ones added below)
+    vk_dlaa_device_exts(ep, ne, ext, &n_ext, 36);  // (DLAA: what NGX needs; room left for the ones added below)
     free(ep);
 
     // features the backend relies on (all present on current desktop drivers)
@@ -840,9 +893,11 @@ static void create_device(void) {
     VkPhysicalDevicePresentWaitFeaturesKHR have_pw = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
                                                       .pNext = x_rb2 ? &have_rb2 : NULL};
     VkPhysicalDevicePresentIdFeaturesKHR have_pid = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR, .pNext = &have_pw};
+    VkPhysicalDeviceVulkan11Features have11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     VkPhysicalDeviceVulkan12Features have12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                                .pNext = x_pw ? (void *)&have_pid : x_rb2 ? (void *)&have_rb2 : NULL};
-    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have12};
+    have11.pNext = &have12;
+    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have11};
 #if defined(__linux__) && defined(VK_EXT_map_memory_placed)
     VkPhysicalDeviceMapMemoryPlacedFeaturesEXT have_placed = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
     if (placed_ext) have_placed.pNext = have12.pNext, have12.pNext = &have_placed;
@@ -861,6 +916,30 @@ static void create_device(void) {
     if (eds3_ext) have_eds3.pNext = have.pNext, have.pNext = &have_eds3;
 #endif
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+    g_vk.fsr4 = false;
+    if (fsr4_req && fsr4_cm_ext && fsr4_f8_ext) {
+#if defined(VK_KHR_cooperative_matrix) && defined(VK_EXT_shader_float8)
+        VkPhysicalDeviceCooperativeMatrixFeaturesKHR have_cm = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+        VkPhysicalDeviceShaderFloat8FeaturesEXT have_f8 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT, .pNext = &have_cm};
+        VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR have_cd = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR, .pNext = &have_f8};
+        VkPhysicalDeviceFeatures2 q = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                     .pNext = fsr4_cd_ext ? (void *)&have_cd : (void *)&have_f8};
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &q);
+        fsr4_cd_quads = have_cd.computeDerivativeGroupQuads;
+        fsr4_cd_linear = have_cd.computeDerivativeGroupLinear;
+        g_vk.fsr4 = have_cm.cooperativeMatrix && have_f8.shaderFloat8 && have_f8.shaderFloat8CooperativeMatrix &&
+                    have.features.shaderInt16 && have.features.shaderStorageImageExtendedFormats &&
+                    have.features.shaderStorageImageWriteWithoutFormat && have11.variablePointers &&
+                    have11.variablePointersStorageBuffer && have11.storageBuffer16BitAccess && have12.shaderFloat16 &&
+                    have12.shaderInt8 && have12.storageBuffer8BitAccess && have12.uniformAndStorageBuffer8BitAccess &&
+                    have12.vulkanMemoryModel && have12.vulkanMemoryModelDeviceScope;
+        if (!g_vk.fsr4)
+            LOG("[vk] FSR 4.1.2: this GPU or driver lacks cooperative matrix / shader float8 / the 8- and 16-bit features\n");
+#endif
+    }
     x_rb2 = x_rb2 && have.features.robustBufferAccess && have_rb2.robustBufferAccess2 && have_rb2.robustImageAccess2;
     if (x_rb2) ext[n_ext++] = VK_EXT_ROBUSTNESS_2_EXTENSION_NAME;
     x_pw = x_pw && have_pid.presentId && have_pw.presentWait;
@@ -998,10 +1077,17 @@ static void create_device(void) {
     VkPhysicalDeviceDynamicRenderingFeaturesKHR fdr = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR,
                                                        .dynamicRendering = VK_TRUE, .pNext = tail};
     if (x_dr) tail = &fdr;
+    // (the 1.3 feature struct was filled before the extension feature structs above were added to tail; the extended
+    // dynamic state bit has to reach it when the promoted extension is enabled on a 1.3 device - see x_ds)
+    if (v13 && x_ds) fds.pNext = f13.pNext, f13.pNext = &fds;
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                             .timelineSemaphore = VK_TRUE, .shaderInt8 = VK_TRUE, .samplerMirrorClampToEdge = VK_TRUE,
                                             .uniformAndStorageBuffer8BitAccess = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE,
-                                            .scalarBlockLayout = VK_TRUE, .bufferDeviceAddress = g_vk.bda, .shaderOutputLayer = have12.shaderOutputLayer,
+                                            .scalarBlockLayout = VK_TRUE, .bufferDeviceAddress = g_vk.bda,
+                                            .shaderFloat16 = g_vk.fsr4 && have12.shaderFloat16,
+                                            .vulkanMemoryModel = g_vk.fsr4 && have12.vulkanMemoryModel,
+                                            .vulkanMemoryModelDeviceScope = g_vk.fsr4 && have12.vulkanMemoryModelDeviceScope,
+                                            .shaderOutputLayer = have12.shaderOutputLayer,
                                             .samplerFilterMinmax = have12.samplerFilterMinmax,
                                             .shaderOutputViewportIndex = have12.shaderOutputViewportIndex, .pNext = v13 ? (void *)&f13 : tail};
     if (!v13) {  // (an older driver may lack some: say which, and ask only for what it has)
@@ -1011,7 +1097,10 @@ static void create_device(void) {
 #undef VK_WANT12
     }
     VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
-                                            .storageBuffer16BitAccess = VK_TRUE, .pNext = &f12};
+                                            .storageBuffer16BitAccess = VK_TRUE,
+                                            .variablePointers = g_vk.fsr4 && have11.variablePointers,
+                                            .variablePointersStorageBuffer = g_vk.fsr4 && have11.variablePointersStorageBuffer,
+                                            .pNext = &f12};
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
                                            .pNext = &f11};
     VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&ff : (void *)&f11};
@@ -1033,6 +1122,21 @@ static void create_device(void) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT, .graphicsPipelineLibrary = VK_TRUE};
     if (g_vk.gpl_probe) en_gpl.pNext = f.pNext, f.pNext = &en_gpl;
 #endif
+#if defined(VK_KHR_cooperative_matrix) && defined(VK_EXT_shader_float8)
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR en_cm = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+        .cooperativeMatrix = VK_TRUE, .cooperativeMatrixRobustBufferAccess = VK_FALSE};
+    VkPhysicalDeviceShaderFloat8FeaturesEXT en_f8 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT,
+        .shaderFloat8 = VK_TRUE, .shaderFloat8CooperativeMatrix = VK_TRUE, .pNext = &en_cm};
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR en_cd = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR,
+        .computeDerivativeGroupQuads = fsr4_cd_quads, .computeDerivativeGroupLinear = fsr4_cd_linear};
+    if (g_vk.fsr4) {
+        en_cm.pNext = f.pNext, f.pNext = &en_f8;
+        if (fsr4_cd_ext) en_cd.pNext = f.pNext, f.pNext = &en_cd;
+    }
+#endif
     VkPhysicalDeviceFeatures *b = &f.features, *h = &have.features;
     b->independentBlend = h->independentBlend;
     b->drawIndirectFirstInstance = h->drawIndirectFirstInstance;  // (the game's GPU-culled draws start past instance 0: GPU-AV)
@@ -1053,6 +1157,10 @@ static void create_device(void) {
     g_vk.ssbo_chunks = h->fragmentStoresAndAtomics && h->vertexPipelineStoresAndAtomics && h->robustBufferAccess;
     b->shaderClipDistance = h->shaderClipDistance;
     b->geometryShader = h->geometryShader;  // (fragment shaders reading gl_Layer: the Geometry capability)
+    b->shaderInt16 = g_vk.fsr4 && h->shaderInt16;
+    b->shaderStorageImageExtendedFormats = g_vk.fsr4 && h->shaderStorageImageExtendedFormats;
+    b->shaderStorageImageWriteWithoutFormat = g_vk.fsr4 && h->shaderStorageImageWriteWithoutFormat;
+    if (g_vk.fsr4) LOG("[vk] FSR 4.1.2: cooperative matrix and shader float8 enabled on this device\n");
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
@@ -1068,10 +1176,23 @@ static void create_device(void) {
     // vkCreateDevice -4 on Dozen two minutes after a device loss on AMD's Vulkan driver - D3D12 refused the new device,
     // likely Windows still recovering the GPU or blocking this program after the reset). The settings file already says
     // Vulkan (the Graphics API choice is only kept once the device and swapchain are up), so this can't loop.
-    if (created != VK_SUCCESS && g_vk.dozen && !ENV("LARECOMP_DX12_NO_FALLBACK")) {
-        LOG("[vk] DirectX 12 (Dozen) could not create its device (%d: %s): starting again on Vulkan\n", created,
-            created == VK_ERROR_DEVICE_LOST ? "Direct3D 12 reports the GPU removed or reset" : "Direct3D 12 refused");
-        launcher_log_file("[vk] DirectX 12 could not create its device (%d): started again on Vulkan\n", created);
+    // DirectX 12 on an NVIDIA GPU (the setting, not LARECOMP_DX12=1): the same. It is there for AMD cards whose Vulkan
+    // driver crashes the game; on NVIDIA, Vulkan is the right path, and Dozen there crashed in its own layer at the
+    // first frames (#172, RTX 4050 Laptop, v0.1.17) and, on v0.1.18, froze on the start screen (a fence waited 2 s and
+    // more, nothing drawn) - no crash, so e380c58's switch never came.
+    bool dzn_nvidia = created == VK_SUCCESS && g_vk.dozen && !ENV("LARECOMP_DX12") &&
+                      (g_vk.props.vendorID == 0x10de || strstr(g_vk.props.deviceName, "NVIDIA"));
+    if ((created != VK_SUCCESS || dzn_nvidia) && g_vk.dozen && !ENV("LARECOMP_DX12_NO_FALLBACK")) {
+        if (dzn_nvidia) {
+            LOG("[vk] DirectX 12 (Dozen) on an NVIDIA GPU (%s): starting again on Vulkan, this GPU's own driver "
+                "(LARECOMP_DX12=1 keeps DirectX 12)\n", g_vk.props.deviceName);
+            launcher_log_file("[vk] DirectX 12 on an NVIDIA GPU: started again on Vulkan\n");
+            vkDestroyDevice(g_vk.dev, NULL), g_vk.dev = VK_NULL_HANDLE;
+        } else {
+            LOG("[vk] DirectX 12 (Dozen) could not create its device (%d: %s): starting again on Vulkan\n", created,
+                created == VK_ERROR_DEVICE_LOST ? "Direct3D 12 reports the GPU removed or reset" : "Direct3D 12 refused");
+            launcher_log_file("[vk] DirectX 12 could not create its device (%d): started again on Vulkan\n", created);
+        }
         g_settings.dx12 = false;
         settings_save();
         _putenv_s("VK_DRIVER_FILES", "");
@@ -1132,6 +1253,17 @@ static void create_device(void) {
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
                                  .pVulkanFunctions = &vf, .vulkanApiVersion = g_vkc.api,
                                  .flags = budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0};
+    // (test: LARECOMP_TEST_HEAP_LIMIT_MB=<n> - every device-local heap seen as that small, like an integrated GPU's
+    // carve-out: textures.c's budget fallback, #281)
+    VkDeviceSize heap_limit[VK_MAX_MEMORY_HEAPS];
+    if (getenv("LARECOMP_TEST_HEAP_LIMIT_MB")) {
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+        for (uint32_t h = 0; h < VK_MAX_MEMORY_HEAPS; h++)
+            heap_limit[h] = h < mp.memoryHeapCount && (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                                ? (VkDeviceSize)atoll(getenv("LARECOMP_TEST_HEAP_LIMIT_MB")) << 20 : VK_WHOLE_SIZE;
+        ai.pHeapSizeLimit = heap_limit;
+    }
     VK_CHECK(vmaCreateAllocator(&ai, &g_vk.vma));
     vk_log_memory("start");
 
@@ -1273,8 +1405,6 @@ static void create_swapchain(void) {
         .oldSwapchain = old};
     VkResult sr = vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain);
 #ifdef _WIN32
-    if (sr == VK_SUCCESS && !g_vk.dozen && ENV("LARECOMP_TEST_AMD_SWAPCHAIN_FAIL"))
-        vkDestroySwapchainKHR(g_vk.dev, g_vk.swapchain, NULL), g_vk.swapchain = VK_NULL_HANDLE, sr = VK_ERROR_UNKNOWN;
     if (sr == VK_SUCCESS && g_vk.dozen && ENV("LARECOMP_TEST_DX12_SWAPCHAIN_FAIL"))  // (tests what follows)
         vkDestroySwapchainKHR(g_vk.dev, g_vk.swapchain, NULL), g_vk.swapchain = VK_NULL_HANDLE, sr = VK_ERROR_OUT_OF_HOST_MEMORY;
 #endif
@@ -1295,30 +1425,8 @@ static void create_swapchain(void) {
             ci.compositeAlpha = (VkCompositeAlphaFlagBitsKHR)(caps.supportedCompositeAlpha & -caps.supportedCompositeAlpha);
         count = ci.minImageCount;
         sr = vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain);
-#ifdef _WIN32
-        if (sr == VK_SUCCESS && !g_vk.dozen && ENV("LARECOMP_TEST_AMD_SWAPCHAIN_FAIL"))
-            vkDestroySwapchainKHR(g_vk.dev, g_vk.swapchain, NULL), g_vk.swapchain = VK_NULL_HANDLE, sr = VK_ERROR_UNKNOWN;
-#endif
         LOG("[vk] swapchain again (fifo, %u images, no copies out): %s (%d)\n", count, sr == VK_SUCCESS ? "ok" : "failed", sr);
 #ifdef _WIN32
-        // Some AMD drivers reject both initial window swapchains. Try the bundled DirectX driver once;
-        // never restart a running game and never override an explicitly selected driver.
-        char dozen_icd[1100];
-        if (sr != VK_SUCCESS && !old && !g_vk.dozen &&
-            (g_vk.props.vendorID == 0x1002 || ENV("LARECOMP_TEST_AMD_SWAPCHAIN_FAIL")) &&
-            !getenv("LARECOMP_AUTO_DX12") && !getenv("LARECOMP_DX12") &&
-            !getenv("VK_DRIVER_FILES") && !getenv("VK_ICD_FILENAMES") &&
-            rt_resource("dx12/dzn_icd.x86_64.json", NULL, dozen_icd, sizeof dozen_icd)) {
-            LOG("[vk] AMD Vulkan could not create the initial window (%d): trying DirectX 12 once\n", sr);
-            launcher_log_file("[vk] AMD Vulkan could not create the initial window (%d): trying DirectX 12 once\n", sr);
-            g_settings.dx12 = true;
-            settings_save();
-            _putenv_s("LARECOMP_AUTO_DX12", "1");
-            if (plat_relaunch()) exit(0);
-            g_settings.dx12 = false;
-            settings_save();
-            LOG("[vk] could not restart for the DirectX 12 fallback\n");
-        }
         if (sr == VK_SUCCESS && g_vk.dozen && ENV("LARECOMP_TEST_DX12_SWAPCHAIN_FAIL"))
             vkDestroySwapchainKHR(g_vk.dev, g_vk.swapchain, NULL), g_vk.swapchain = VK_NULL_HANDLE, sr = VK_ERROR_OUT_OF_HOST_MEMORY;
         // DirectX 12 (Dozen) with no window to draw in: start again on Vulkan, as when its device can't start (#159)
@@ -1690,14 +1798,19 @@ static int screen_watch(void *arg) {
     bool test = ENV("LARECOMP_TEST_SCREEN_STALE") != NULL, have = false;
     bool fired = false, moved = false;  // (a recovery asked for; the grab changed since)
     uint32_t last_scr = 0, last_img = 0;
-    int stale = 0;
+    int stale = 0, since = 0;  // (since: grabs since the recovery)
     for (;;) {
         SDL_Delay(1000);
         void *hwnd = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
         uint32_t scr = 0, img = atomic_load(&g_img_changes);
         // (in the background or minimised: can't tell - and the window shown anew after it, a recovery counts again)
         if (!test && !plat_window_screen_hash(hwnd, &scr)) { have = fired = false, stale = 0; continue; }
-        if (have && scr != last_scr) moved = true;
+        // The grab changing counts once two grabs have passed since the recovery: the new swapchain's own black frame
+        // and the redraw after it are a change the grab sees even where it is blind to the game's frames (fullscreen,
+        // frames flipped to the display) - taken for "it worked", a blink every few seconds on and on (seen 4 times
+        // in 2 minutes at 50 fps, fullscreen; each focus change let it start again).
+        since++;
+        if (have && scr != last_scr && (!fired || since > 2)) moved = true;
         // (the game's image moving meanwhile)
         stale = have && scr == last_scr && (img - last_img >= 5 || test) ? stale + 1 : 0;
         have = true, last_scr = scr, last_img = img;
@@ -1708,7 +1821,7 @@ static int screen_watch(void *arg) {
             return 0;
         }
         atomic_store(&g_screen_stale, true);
-        stale = 0, fired = true, moved = false;
+        stale = 0, fired = true, moved = false, since = 0;
     }
     return 0;
 }
@@ -2193,7 +2306,7 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
         extern void widescreen_frame_end(uint64_t frame);
         widescreen_frame_end(frame);
         extern void widescreen_set_factor(float f);
-        extern bool widescreen_allowed(void);
+        extern bool widescreen_allowed_for(double w, double h);
         // render scale + placement in the window: runtime/nvn/output_scale.c (Video tab "Internal resolution");
         // GPU time since the last frame (exec.c's GPU timer; -1 without one: dynamic resolution goes by frame times):
         // the game's submissions and the window image's (LARECOMP_DYNRES_COUNT_PRESENT=0: the game's only, as before)
@@ -2221,7 +2334,7 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
             sp_have = true;
         }
         OutScale os;
-        output_scale(dw, dh, widescreen_allowed(), SDL_GetTicksNS() / 1e9, game_ms, win_ms, &os);
+        output_scale(dw, dh, widescreen_allowed_for(dw, dh), SDL_GetTicksNS() / 1e9, game_ms, win_ms, &os);
         {   // F1 > FSR 2 render resolution: the scene drawn smaller, FSR 2 upscaling it (exec.c vk_taa_render_share)
             extern float vk_taa_render_share(void);
             extern void renderer_set_present_full(bool on);
@@ -2260,7 +2373,6 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
         if (menu_at && (long)frame + 1 == menu_at) { extern void menu_test_open(void); menu_test_open(); }
         // (ImGui records through vk_overlay_begin / vk_overlay_end, when it draws anything)
         vk_hdr_mark_base();
-        menu_set_game_viewport((float)vx, (float)vy, (float)vw, (float)vh);
         menu_render((void *)cb, g_vk.sc_extent.width, g_vk.sc_extent.height);
         pp_mark(PP_OVERLAY);
         static long win_shot = -1;
@@ -2373,6 +2485,8 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
     }
 }
 
+static _Atomic long debug_frames_at, debug_frames_n;  // (present_hooks: the frames to dump; debug_frame_after_present)
+void debug_frame_after_present(uint64_t frame);
 // The game thread's side of a present: the frame counters and the per-frame hooks (input, pacing, test hooks).
 static void present_hooks(void) {
     total_frames++;
@@ -2407,7 +2521,16 @@ static void present_hooks(void) {
     // LARECOMP_DEBUG_FRAMES=<n> (with LARECOMP_DEBUG_FRAME / F9): dump n consecutive frames (build/pass_<frame>_NNN.png)
     static long debug_n = -1;
     if (debug_n < 0) { const char *e = ENV("LARECOMP_DEBUG_FRAMES"); debug_n = e && atol(e) > 1 ? atol(e) : 1; }
-    g_debug_frame = debug_at && total_frames >= (uint64_t)debug_at && total_frames < (uint64_t)debug_at + (uint64_t)debug_n;
+    atomic_store(&debug_frames_at, debug_at), atomic_store(&debug_frames_n, debug_n);
+    if (!rq_on()) debug_frame_after_present(total_frames - 1);
+}
+
+// The frames dumped (F9 / LARECOMP_DEBUG_FRAME) are decided where their lists are translated: with the render thread
+// that is after it ran the present before them (rqueue.c) - set here, on the game thread, the flag was over by the
+// time the render thread got to the frame, and F9 caught only its first few passes.
+void debug_frame_after_present(uint64_t frame) {
+    long at = atomic_load(&debug_frames_at), n = atomic_load(&debug_frames_n);
+    g_debug_frame = at && frame + 1 >= (uint64_t)at && frame + 1 < (uint64_t)at + (uint64_t)n;
 }
 
 void backend_present(NvnTexture *t) {
@@ -2509,13 +2632,7 @@ void ui_window_init(void) {
         const char *v = ENV("LARECOMP_NO_USER_INPUT");
         bool scripted = v ? atoi(v) != 0 : (ENV("LARECOMP_INPUT") || ENV("LARECOMP_DOORJUMP_TEST") || ENV("LARECOMP_PLACE") ||
                                             ENV("LARECOMP_HOST_INPUT") || ENV("LARECOMP_BIND_TEST"));
-        if (scripted) {
-            // Ignoring events alone does not stop the OS from focusing a fullscreen window.
-            // Unattended runs must also leave desktop input with the user's application.
-            wflags |= SDL_WINDOW_NOT_FOCUSABLE;
-            SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
-            SDL_SetHint(SDL_HINT_MOUSE_AUTO_CAPTURE, "0");
-        }
+        if (scripted) SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
     }
     // Graphics API: DirectX 12 (the setting, LARECOMP_DX12=0/1 over it): the Vulkan loader is pointed at the shipped
     // Dozen (dx12/dzn_icd.x86_64.json next to the exe: Mesa's Vulkan on Direct3D 12, patched for this game) instead of
@@ -2545,6 +2662,11 @@ void ui_window_init(void) {
     window = SDL_CreateWindow("ZA Recomp", win_w, win_h, wflags);
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
     rt_window_icon(window);
+    if (ENV("LARECOMP_WINDOW_POS")) {  // (two games side by side: local play tests)
+        int x = 0, y = 0;
+        sscanf(ENV("LARECOMP_WINDOW_POS"), "%d,%d", &x, &y);
+        SDL_SetWindowPosition(window, x, y);
+    }
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
     if (g_settings.fullscreen && !ENV("LARECOMP_WINDOW") && !ENV("LARECOMP_HIDDEN")) SDL_SetWindowFullscreen(window, true);
     create_instance();
@@ -2590,6 +2712,18 @@ void backend_clear_window(void) {
     static const float black[4] = {0, 0, 0, 1};
     if (g_vk.dev && vk_frame_begin(black)) vk_frame_end(NULL);
 }
+// A black frame with the overlay's notice line (menu_notice) on it, before the game shows any frame of its own: the
+// shader preparation at the game's GPU setup (shader_prep.c boot_progress) - minutes on a slow driver after an update,
+// a black window the players took for a hang and closed (#291 #297). On the game thread, which is in the preparation:
+// nothing else presents. LARECOMP_PREP_SHOT=<n>: the n-th such frame into build/prep.png (tests).
+void backend_notice_frame(void) {
+    static const float black[4] = {0, 0, 0, 1};
+    static long n, shot = -1;
+    if (shot < 0) shot = getenv("LARECOMP_PREP_SHOT") ? atol(getenv("LARECOMP_PREP_SHOT")) : 0;
+    if (!g_vk.dev || rq_stopping() || !vk_frame_begin(black)) return;
+    menu_render((void *)vk_cmd(), g_vk.sc_extent.width, g_vk.sc_extent.height);
+    vk_frame_end(shot && ++n == shot ? "build/prep.png" : NULL);
+}
 
 // [window]: what happens to the window (focus, minimised, covered, display) - #15: a window that stops responding
 static void window_event_log(const SDL_Event *e) {
@@ -2629,23 +2763,11 @@ int ui_run(void) {
                 input_rumble_stop();
                 input_led_stop();
                 LOG("window closed\n");
-#ifdef _WIN32
-                extern void plat_shutdown_watchdog_start(void);
-                plat_shutdown_watchdog_start();
-                const char *test_stall = getenv("LARECOMP_TEST_QUIT_STALL_MS");
-                if (test_stall) SDL_Delay((Uint32)strtoul(test_stall, NULL, 10));
-#endif
-                backend_quit();
-#ifdef _WIN32
-                if (validating) validation_exit();
-                fflush(stdout); fflush(stderr);
-                plat_terminate();  // Avoid unrelated CRT exit handlers stalling with guest threads still running.
-#endif
+                backend_quit();  // (before exit(): see there)
                 exit(0);
             }
             extern bool input_user_blocked(const SDL_Event *e);
             if (input_user_blocked(&e)) continue;  // scripted test runs: the real keyboard / mouse / pads do nothing (as metal.m)
-            input_note_prompt_event(&e);
             input_cursor_event(&e);
             atomic_store(&ui_stage, "menu_handle_event");
             if (menu_handle_event(&e)) continue;

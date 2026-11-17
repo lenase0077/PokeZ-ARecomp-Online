@@ -140,6 +140,7 @@ typedef struct {
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import, dmabuf;
+    bool fsr4;  // the device has what the FSR 4.1.2 provider needs (cooperative matrix + shader float8; device.c)
     bool quad_control, max_reconv;  // (VK_KHR_shader_quad_control / _maximal_reconvergence: translate.c quad_control_on)
     // Mesa's Dozen: Vulkan on Direct3D 12 (the driver's VK_DRIVER_ID_MESA_DOZEN). Its Direct3D rules where they differ
     // from what other drivers take (exec.c begin_pass)
@@ -223,6 +224,7 @@ typedef struct TexBackend {
     bool gpu_owned, uploaded, dynamic;
     bool prefetched;  // (uploaded at its registration, not drawn yet: textures.c backend_prefetch_texture)
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
+    uint64_t name_hash;  // (textures.c: the name pack textures go by - hash_full; data_hash may be the fast hash)
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
     bool scalable, presented, shown;  // (shown: presented itself, not only copied into a presented image)
     uint64_t touched_frame, frame_cleared;

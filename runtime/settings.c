@@ -148,7 +148,7 @@ const char *settings_language_name(void) {
 
 int g_default_upscaler = UPSCALE_SHARP;
 static const char *const sharpen_names[SHARPEN_N] = {"auto", "off", "low", "medium", "high"};  // (the ini)
-static const char *const taa_names[] = {"game", "fsr2", "dlaa", "fsr3"};  // (the ini, TAA_*)
+static const char *const taa_names[] = {"game", "fsr2", "dlaa", "fsr3", "fsr4"};  // (the ini, TAA_*)
 #define TAA_N (int)(sizeof taa_names / sizeof *taa_names)
 int g_default_res_mode = RES_MATCH;
 bool g_gpu_integrated;
@@ -302,6 +302,7 @@ void settings_load(void) {
         }
         if (fields != 2) continue;
         if (!strcmp(key, "aspect")) g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL : ASPECT_UNLOCKED;
+        else if (!strcmp(key, "hud_width")) { int v = atoi(val); g_settings.hud_width = v < 0 ? 0 : v > 100 ? 100 : v; }
         else if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
         else if (!strcmp(key, "microphone_gain")) g_settings.mic_gain = (float)atof(val);
@@ -453,6 +454,7 @@ void settings_save(void) {
     if (!f) { LOG("[settings] cannot write %s\n", SETTINGS_FILE); return; }
     fprintf(f, "# ZA Recomp settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
     fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original" : "unlocked");
+    fprintf(f, "hud_width = %d\n", g_settings.hud_width);
     fprintf(f, "fullscreen = %d\n", g_settings.fullscreen);
     fprintf(f, "volume = %.2f\n", g_settings.volume);
     fprintf(f, "microphone_gain = %.2f\n", g_settings.mic_gain);

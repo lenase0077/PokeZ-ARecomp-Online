@@ -15,6 +15,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import invite_code
+import private_features as pf
 import private_server as ps
 import profiles
 
@@ -98,8 +99,11 @@ class PrivateServerProtocolTests(unittest.TestCase):
         info_to_b = [p for dst, p in r2 if dst == ('127.0.0.1', 40002) and p[3] == ps.PKT_INFO]
         self.assertEqual(len(info_to_a), 1)
         self.assertEqual(len(info_to_b), 1)
-        self.assertIn(b'Amorcito', info_to_a[0])
-        self.assertIn(b'Leandro', info_to_b[0])
+        # Verify 0x91 layout: count=1, pid(2), rev(1), nlen(1), name[nlen], hashes[104]
+        self.assertEqual(info_to_a[0][13 : 13 + len(b'Amorcito')], b'Amorcito')
+        self.assertEqual(info_to_a[0][13 + len(b'Amorcito') : 13 + len(b'Amorcito') + 104], hashes_b)
+        self.assertEqual(info_to_b[0][13 : 13 + len(b'Leandro')], b'Leandro')
+        self.assertEqual(info_to_b[0][13 + len(b'Leandro') : 13 + len(b'Leandro') + 104], hashes_a)
 
         # Player A uploads full outfit body via INFO_UPDATE (0x12) -> Player B gets 0x91 + 0x94
         body_blob = b'\x01' + b'\x55' * 20
@@ -415,6 +419,146 @@ class InviteCodeAndRoomAuthTests(unittest.TestCase):
         srv.handle_packet(b'ZAKNOCK!1234abcd', ('203.0.113.5', 40000), now=1.3)
         res = srv.handle_packet(hello, ('203.0.113.5', 40000), now=1.4)
         self.assertTrue(any(p[3] == ps.PKT_WELCOME for _, p in res))
+
+
+class ExtensionProtocolTests(unittest.TestCase):
+    def _join(self, srv: ps.LumiosePrivateServer, tid: bytes, name: bytes, addr: tuple[str, int]):
+        replies = srv.handle_packet(make_hello(tid, name), addr, now=1.0)
+        welcome = next(p for d, p in replies if d == addr and p[3] == ps.PKT_WELCOME)
+        token = struct.unpack_from('<I', welcome, 4)[0]
+        pid = struct.unpack_from('<H', welcome, 16)[0]
+        return pid, token, replies
+
+    def test_friends_lifecycle_and_persistence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / 'private-room-state.json'
+            wall = [1794960000.0]  # fixed UTC date 2026-11-18
+            srv = ps.LumiosePrivateServer(state_path=state_file, wall_clock=lambda: wall[0])
+            addr_a = ('127.0.0.1', 40101)
+            addr_b = ('190.22.219.1', 40102)
+            pid_a, tok_a, _ = self._join(srv, b'A' * 14, b'Leandro', addr_a)
+            pid_b, tok_b, _ = self._join(srv, b'B' * 14, b'Amorcito', addr_b)
+
+            # A requests B (0x78) -> B receives 0xF8
+            req_pkt = ps.pack_header(pf.PKT_FRIEND_REQUEST, tok_a) + struct.pack('<HH', pid_b, 42)
+            r_req = srv.handle_packet(req_pkt, addr_a, now=2.0)
+            self.assertEqual(len(r_req), 1)
+            self.assertEqual(r_req[0][0], addr_b)
+            f8 = r_req[0][1]
+            self.assertEqual(f8[3], pf.PKT_FRIEND_REQUEST_IN)
+            from_pid, req_id, nlen = struct.unpack_from('<HHB', f8, 8)
+            self.assertEqual((from_pid, req_id), (pid_a, 42))
+            self.assertEqual(f8[13 : 13 + nlen], b'Leandro')
+
+            # B accepts (0x79 answer=1) -> A gets 0xF9 code=1, both get 0xFA + 0xFB
+            ans_pkt = ps.pack_header(pf.PKT_FRIEND_ANSWER, tok_b) + struct.pack('<HHB', pid_a, 42, 1)
+            r_ans = srv.handle_packet(ans_pkt, addr_b, now=2.1)
+            f9 = next(p for d, p in r_ans if d == addr_a and p[3] == pf.PKT_FRIEND_RESULT)
+            self.assertEqual(struct.unpack_from('<HHB', f9, 8), (pid_b, 42, pf.FRIEND_CODE_ACCEPTED))
+            fa_a = next(p for d, p in r_ans if d == addr_a and p[3] == pf.PKT_FRIEND_LIST)
+            fb_a = next(p for d, p in r_ans if d == addr_a and p[3] == pf.PKT_FRIEND_STATUS_LIST)
+            rev_fa, cnt_fa = struct.unpack_from('<IB', fa_a, 8)
+            rev_fb = struct.unpack_from('<I', fb_a, 8)[0]
+            self.assertEqual(cnt_fa, 1)
+            self.assertEqual(rev_fa, rev_fb)
+            self.assertIn(b'Amorcito', fa_a)
+
+            # Duplicate request returns code=6 (ALREADY)
+            r_dup = srv.handle_packet(req_pkt, addr_a, now=2.2)
+            self.assertEqual(r_dup[0][1][12], pf.FRIEND_CODE_ALREADY)
+
+            # Status update (0x7B) updates self & online friend with matching list_rev
+            st_msg = b'Buscando shinies!'
+            r_st = srv.handle_packet(
+                ps.pack_header(pf.PKT_FRIEND_STATUS, tok_b) + bytes([len(st_msg)]) + st_msg,
+                addr_b,
+                now=2.3,
+            )
+            fb_to_a = next(p for d, p in r_st if d == addr_a and p[3] == pf.PKT_FRIEND_STATUS_LIST)
+            self.assertEqual(struct.unpack_from('<I', fb_to_a, 8)[0], rev_fa)
+            self.assertIn(st_msg, fb_to_a)
+
+            # Restart server from saved JSON -> friendship and status persist; B offline shows pid=0
+            srv2 = ps.LumiosePrivateServer(state_path=state_file, wall_clock=lambda: wall[0])
+            pid_a2, tok_a2, _ = self._join(srv2, b'A' * 14, b'Leandro', addr_a)
+            r_list = srv2.handle_packet(
+                ps.pack_header(pf.PKT_FRIEND_LIST_REQ, tok_a2) + struct.pack('<I', 0),
+                addr_a,
+                now=3.0,
+            )
+            fa_2 = next(p for _, p in r_list if p[3] == pf.PKT_FRIEND_LIST)
+            self.assertEqual(fa_2[12], 1)
+            entry_pid = struct.unpack_from('<H', fa_2, 13)[0]
+            self.assertEqual(entry_pid, 0)  # B is offline
+
+            # Remove friend (0x7C) removes bidirectional friendship
+            r_rem = srv2.handle_packet(
+                ps.pack_header(pf.PKT_FRIEND_REMOVE, tok_a2)
+                + struct.pack('<HB', 0, len(b'Amorcito'))
+                + b'Amorcito',
+                addr_a,
+                now=3.1,
+            )
+            fa_empty = next(p for _, p in r_rem if p[3] == pf.PKT_FRIEND_LIST)
+            self.assertEqual(fa_empty[12], 0)
+
+    def test_daily_streak_shiny_charm_bag_and_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / 'private-room-state.json'
+            wall = [1794960000.0]  # 2026-11-18T00:00:00Z
+            srv = ps.LumiosePrivateServer(state_path=state_file, wall_clock=lambda: wall[0])
+            addr = ('127.0.0.1', 40201)
+            _, tok, join_replies = self._join(srv, b'C' * 14, b'Trainer', addr)
+
+            # Initial FC 13 & FC 16 pushed on join
+            fc13 = next(p for _, p in join_replies if p[3] == pf.PKT_EXTENSION_IN and p[8] == pf.SUBOP_DAILY_STREAK)
+            fc16 = next(p for _, p in join_replies if p[3] == pf.PKT_EXTENSION_IN and p[8] == pf.SUBOP_LUMIOSE_BAG)
+            self.assertEqual(len(fc13), 18)
+            self.assertEqual(fc13[9], 1)
+
+            # Ledger 0x40 -> 0xC0 status=1 enforce=0; 0x41 -> 0xC1 seq ack
+            r_led = srv.handle_packet(ps.pack_header(pf.PKT_LEDGER_REPORT, tok) + b'\x01\x00\x00', addr, now=1.1)
+            self.assertEqual(r_led[0][1][3], pf.PKT_LEDGER_STATUS)
+            self.assertEqual((r_led[0][1][8], r_led[0][1][9]), (1, 0))
+            r_ev = srv.handle_packet(ps.pack_header(pf.PKT_LEDGER_EVENTS, tok) + struct.pack('<H', 77), addr, now=1.2)
+            self.assertEqual(r_ev[0][1][3], pf.PKT_LEDGER_ACK)
+            self.assertEqual(struct.unpack_from('<HB', r_ev[0][1], 8), (77, 1))
+
+            # Claim Days 1..5 across consecutive UTC days
+            claim_req = ps.pack_header(pf.PKT_EXTENSION, tok) + bytes([0x13, 0, 0, 0, 0, 3])
+            for expected_day in range(1, 6):
+                r_cl = srv.handle_packet(claim_req, addr, now=2.0 + expected_day)
+                st = next(p for _, p in r_cl if p[3] == pf.PKT_EXTENSION_IN and p[8] == 0x13)
+                bag = next(p for _, p in r_cl if p[3] == pf.PKT_EXTENSION_IN and p[8] == 0x16)
+                code, day, item_id, cd = struct.unpack_from('<BBHI', st, 10)
+                self.assertEqual(code, 2)
+                self.assertEqual(day, expected_day)
+                self.assertGreater(cd, 0)
+                if expected_day < 5:
+                    self.assertEqual(item_id, 0)
+                    # Same-day re-claim returns code=4 and does not increment day
+                    r_again = srv.handle_packet(claim_req, addr, now=2.5 + expected_day)
+                    st2 = next(p for _, p in r_again if p[3] == pf.PKT_EXTENSION_IN and p[8] == 0x13)
+                    self.assertEqual(st2[10], 4)
+                    self.assertEqual(st2[11], expected_day)
+                    wall[0] += 86400.0
+                else:
+                    self.assertEqual(item_id, pf.ITEM_LUMIOSE_SHINY_CHARM)
+                    self.assertEqual(bag[15], 1)  # 1 bag entry
+                    bid, bqty, brem = struct.unpack_from('<HHI', bag, 16)
+                    self.assertEqual((bid, bqty, brem), (1, 1, 0))
+
+            # Activate Lumiose Shiny Charm (7D 13 00 00 00 00 04 01 00) -> code=3, 3600s left
+            use_pkt = ps.pack_header(pf.PKT_EXTENSION, tok) + struct.pack('<BBBBHH', 0x13, 0, 0, 0, 0x0400, 1)
+            r_use = srv.handle_packet(use_pkt, addr, now=10.0)
+            bag_used = r_use[0][1]
+            self.assertEqual(bag_used[12], 3)  # activated popup
+            bid, bqty, brem = struct.unpack_from('<HHI', bag_used, 16)
+            self.assertEqual((bid, bqty, brem), (1, 0, pf.SHINY_CHARM_DURATION_SECONDS))
+
+            # Activating while already active returns code=5
+            r_use2 = srv.handle_packet(use_pkt, addr, now=11.0)
+            self.assertEqual(r_use2[0][1][12], 5)
 
 
 if __name__ == '__main__':

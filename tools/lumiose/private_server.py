@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 import hmac
+from pathlib import Path
 import selectors
 import secrets
 import signal
@@ -12,6 +13,12 @@ import struct
 import sys
 import time
 from typing import Callable
+
+_LUMIOSE_DIR = str(Path(__file__).resolve().parent)
+if _LUMIOSE_DIR not in sys.path:
+    sys.path.insert(0, _LUMIOSE_DIR)
+
+from private_features import RoomExtensions
 
 MAGIC = b'ZA'
 PROTO_VERSION = 1
@@ -174,8 +181,8 @@ def build_info_packet(recipient_token: int, players: list[PlayerSession]) -> byt
     out.append(len(players) & 0xFF)
     for p in players:
         out.extend(struct.pack('<HBB', p.pid, p.info_rev & 0x0F, len(p.name) & 0xFF))
-        out.extend(p.hashes)
         out.extend(p.name)
+        out.extend(p.hashes)
     return bytes(out)
 
 
@@ -229,6 +236,8 @@ class LumiosePrivateServer:
         max_players: int = 8,
         timeout_seconds: float = 15.0,
         room_secret: str | None = None,
+        state_path: Path | str | None = None,
+        wall_clock: Callable[[], float] | None = None,
         verbose: bool = False,
         log_fn: Callable[[str], None] | None = None,
     ) -> None:
@@ -244,6 +253,7 @@ class LumiosePrivateServer:
         self.authorized_addrs: dict[tuple[str, int], float] = {}
         self._rejected_log: set[tuple[str, int]] = set()
         self._snapshot_dirty = False
+        self.extensions = RoomExtensions(state_path=state_path, wall_clock=wall_clock)
 
     def _next_pid(self) -> int | None:
         for candidate in range(1, self.max_players + 1):
@@ -363,8 +373,12 @@ class LumiosePrivateServer:
             return []
 
         if pkt_type == PKT_LEAVE:
-            self._remove_player(player.pid, reason='left')
-            return self.flush_snapshots(now, force=True)
+            leave_replies = self._remove_player(player.pid, reason='left')
+            return leave_replies + self.flush_snapshots(now, force=True)
+
+        ext_replies = self.extensions.handle_packet(pkt_type, data, player, self.players)
+        if ext_replies is not None:
+            return ext_replies
 
         if self.verbose:
             self._log(f'ignored packet 0x{pkt_type:02x} ({len(data)}B) from pid={player.pid}')
@@ -436,6 +450,7 @@ class LumiosePrivateServer:
             (player.addr, build_duel_grant(player.token)),
         ]
         player.duel_granted = True
+        out.extend(self.extensions.on_player_join(player, self.players))
 
         others = [p for p in self.players.values() if p.pid != player.pid]
         if others:
@@ -467,7 +482,7 @@ class LumiosePrivateServer:
                     out.append((other.addr, bpkt))
         return out
 
-    def _remove_player(self, pid: int, reason: str) -> None:
+    def _remove_player(self, pid: int, reason: str) -> list[tuple[tuple[str, int], bytes]]:
         removed = self.players.pop(pid, None)
         if removed is not None:
             self.addr_index.pop(removed.addr, None)
@@ -475,6 +490,8 @@ class LumiosePrivateServer:
             self._log(
                 f'player {reason}: {removed.name.decode("utf-8", "replace")} (pid={pid})'
             )
+            return self.extensions.on_player_leave(removed, self.players)
+        return []
 
     def prune_stale(self, now: float | None = None) -> list[tuple[tuple[str, int], bytes]]:
         if now is None:
@@ -484,8 +501,9 @@ class LumiosePrivateServer:
             for pid, p in self.players.items()
             if (now - p.last_seen) >= self.timeout_seconds
         ]
+        out: list[tuple[tuple[str, int], bytes]] = []
         for pid in stale:
-            self._remove_player(pid, reason='timed out')
+            out.extend(self._remove_player(pid, reason='timed out'))
         expired_auth = [
             addr
             for addr, ts in self.authorized_addrs.items()
@@ -494,8 +512,8 @@ class LumiosePrivateServer:
         for addr in expired_auth:
             self.authorized_addrs.pop(addr, None)
         if stale:
-            return self.flush_snapshots(now, force=True)
-        return []
+            out.extend(self.flush_snapshots(now, force=True))
+        return out
 
     def flush_snapshots(
         self, now: float | None = None, *, force: bool = False
@@ -534,6 +552,7 @@ def run_server(
     tick_hz: float = 30.0,
     timeout_seconds: float = 15.0,
     room_secret: str | None = None,
+    state_path: Path | str | None = None,
     verbose: bool = False,
 ) -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -546,6 +565,7 @@ def run_server(
         max_players=max_players,
         timeout_seconds=timeout_seconds,
         room_secret=room_secret,
+        state_path=state_path,
         verbose=verbose,
     )
     sel = selectors.DefaultSelector()
@@ -624,13 +644,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--timeout', type=float, default=15.0, help='Idle client timeout in seconds')
     parser.add_argument('--room-secret', default='', help='Require ZAKNOCK! room secret before HELLO')
     parser.add_argument('--from-config', action='store_true', help='Load port and room secret from lumiose/private-server.json')
+    parser.add_argument('--state-file', default='', help='Path to persistent JSON room state (friends, daily streak, bag)')
     parser.add_argument('--verbose', action='store_true', help='Log unknown/unhandled opcodes')
     args = parser.parse_args(argv)
 
     port = args.port
     room_secret = args.room_secret.strip() or None
+    state_path: Path | None = Path(args.state_file.strip()) if args.state_file.strip() else None
     if args.from_config:
-        from pathlib import Path
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import profiles as profile_store
 
@@ -638,6 +659,8 @@ def main(argv: list[str] | None = None) -> int:
         settings = profile_store.ensure_host_invite(root)
         port = settings['host_port']
         room_secret = settings['room_secret']
+        if state_path is None:
+            state_path = root / 'lumiose' / 'private-room-state.json'
         code = profile_store.write_room_code_file(root, settings)
         if code:
             print(f'[lumiose server] Invite Code (share with partner): {code}', flush=True)
@@ -649,6 +672,7 @@ def main(argv: list[str] | None = None) -> int:
         tick_hz=args.tick_hz,
         timeout_seconds=args.timeout,
         room_secret=room_secret,
+        state_path=state_path,
         verbose=args.verbose,
     )
 

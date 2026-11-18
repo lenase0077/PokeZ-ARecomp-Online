@@ -41,6 +41,7 @@ __pycache__/
 /lumiose/update.lock
 /lumiose/config.json
 /lumiose/private-server.json
+/lumiose/private-room-state.json
 /lumiose/profiles.json
 # User game ROMs, keys, logs, screenshots, and local compiled binaries
 /ZA/

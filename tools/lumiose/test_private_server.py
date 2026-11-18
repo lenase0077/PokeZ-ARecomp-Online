@@ -732,6 +732,71 @@ class CoopAndEventsTests(unittest.TestCase):
             c4_after = next(p for _, p in r_settle if p[3] == pc.PKT_DAYCARE_SLOTS)
             self.assertEqual(c4_after[10], 0)
 
+    def test_automatic_events_happy_hour_rotation_and_auto_raid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / 'private-room-state.json'
+            wall = [1794960000.0]
+            srv = ps.LumiosePrivateServer(state_path=state_file, wall_clock=lambda: wall[0])
+            addr_a = ('127.0.0.1', 40701)
+            addr_b = ('190.22.219.1', 40702)
+            _, tok_a, _ = self._join(srv, b'A' * 14, b'Leandro', addr_a)
+            _, tok_b, _ = self._join(srv, b'B' * 14, b'Amorcito', addr_b)
+
+            # First tick schedules timers lazily while room has players
+            self.assertEqual(srv.tick(), [])
+            self.assertEqual(srv.extensions.coop.auto_next_raid_at, wall[0] + pc.DEFAULT_AUTO_RAID_SECS)
+            self.assertEqual(srv.extensions.coop.auto_next_event_at, wall[0] + pc.DEFAULT_AUTO_INTERVAL_SECS)
+
+            # Advance 30 min -> automatic Raid Boss spot opens + broadcasts chat notice
+            wall[0] += pc.DEFAULT_AUTO_RAID_SECS
+            r_raid = srv.tick()
+            self.assertIsNotNone(srv.extensions.coop.active_raid)
+            self.assertTrue(any(d == addr_b and p[3] == pf.PKT_EXTENSION_IN and p[8] == pc.RX_SUBOP_RAID_SPOTS for d, p in r_raid))
+            self.assertTrue(any(d == addr_a and p[3] == ps.PKT_CHAT_IN and b'Raid Boss disponible' in p for d, p in r_raid))
+
+            # Advance +15 min (total 45 min) -> Happy Hour #1 activates shiny_event + gives Shiny Charm
+            wall[0] += pc.DEFAULT_AUTO_INTERVAL_SECS - pc.DEFAULT_AUTO_RAID_SECS
+            r_hh = srv.tick()
+            self.assertTrue(srv.extensions.coop.is_event_on('shiny_event'))
+            self.assertEqual(srv.extensions.coop.auto_active_event, 'shiny_event')
+            self.assertTrue(any(d == addr_b and p[3] == pf.PKT_EXTENSION_IN and p[8] == pf.SUBOP_LUMIOSE_BAG for d, p in r_hh))
+            self.assertTrue(any(d == addr_a and p[3] == ps.PKT_CHAT_IN and b'Happy Hour' in p for d, p in r_hh))
+
+            # Advance past 15 min duration -> cleanly turns off shiny_event and announces end
+            wall[0] += pc.DEFAULT_AUTO_DURATION_SECS + 1
+            r_end = srv.tick()
+            self.assertFalse(srv.extensions.coop.is_event_on('shiny_event'))
+            self.assertIsNone(srv.extensions.coop.auto_active_event)
+            self.assertTrue(any(d == addr_b and p[3] == ps.PKT_CHAT_IN and b'Finalizo' in p for d, p in r_end))
+
+            # Non-admin can query /autoevent status, but cannot trigger /autoevent now
+            r_stat = srv.handle_packet(self._chat(tok_b, b'/autoevent'), addr_b, now=2.0)
+            self.assertTrue(any(p[3] == ps.PKT_CHAT_IN and b'AutoEventos=ON' in p for _, p in r_stat))
+            r_deny = srv.handle_packet(self._chat(tok_b, b'/autoevent now'), addr_b, now=2.1)
+            self.assertIn(b'Solo el host', r_deny[0][1])
+
+            # Admin configures timings, triggers /autoevent now (rotates to instant_hatch), and persists across restart
+            srv.handle_packet(self._chat(tok_a, b'/autoevent interval 10'), addr_a, now=2.2)
+            srv.handle_packet(self._chat(tok_a, b'/autoevent duration 5'), addr_a, now=2.3)
+            srv.handle_packet(self._chat(tok_a, b'/autoevent raid 0'), addr_a, now=2.4)
+            r_now = srv.handle_packet(self._chat(tok_a, b'/autoevent now'), addr_a, now=2.5)
+            self.assertTrue(srv.extensions.coop.is_event_on('instant_hatch'))
+            self.assertEqual(srv.extensions.coop.auto_active_event, 'instant_hatch')
+            self.assertTrue(any(d == addr_b and p[3] == ps.PKT_CHAT_IN and b'Guarderia Turbo' in p for d, p in r_now))
+
+            srv2 = ps.LumiosePrivateServer(state_path=state_file, wall_clock=lambda: wall[0])
+            self.assertTrue(srv2.extensions.coop.is_event_on('instant_hatch'))
+            self.assertEqual(srv2.extensions.coop.auto_active_event, 'instant_hatch')
+            self.assertEqual(srv2.extensions.coop.auto_interval_secs, 600)
+            self.assertEqual(srv2.extensions.coop.auto_duration_secs, 300)
+            self.assertEqual(srv2.extensions.coop.auto_raid_secs, 0)
+
+            # Turning auto off stops the currently active auto-bonus too
+            srv2.handle_console_command('event auto off')
+            self.assertFalse(srv2.extensions.coop.is_event_on('auto_events'))
+            self.assertFalse(srv2.extensions.coop.is_event_on('instant_hatch'))
+            self.assertIsNone(srv2.extensions.coop.auto_active_event)
+
 
 if __name__ == '__main__':
     unittest.main()

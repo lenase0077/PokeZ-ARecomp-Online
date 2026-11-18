@@ -15,6 +15,7 @@ Los comandos funcionan desde dos lugares:
 - **Comandos públicos** (cualquier jugador conectado):
   - `/help` (o `/ayuda`, `/?`)
   - `/events` (o `/eventos`)
+  - `/autoevent` (o `/autoevent status`)
   - `/p <mensaje>` (solo dentro de una Party)
 - **Comandos de administrador**: requieren una de estas condiciones:
   - Estar ejecutando el comando desde la **consola del servidor**.
@@ -50,6 +51,7 @@ Los comandos funcionan desde dos lugares:
 | `raids` | `ON` (`True`) | `raid`, `raids` | Habilita o bloquea las Raids cooperativas y actualiza en vivo el acceso de Raids. |
 | `nursery` | `ON` (`True`) | `nursery`, `huevos`, `daycare`, `egg`, `eggs` | Habilita o deshabilita la Guardería / Huevos. |
 | `mystery_gift` | `ON` (`True`) | `gift`, `gifts`, `mystery`, `mystery_gift`, `regalo` | Habilita o deshabilita el canje de códigos de Mystery Gift. |
+| `auto_events` | `ON` (`True`) | `auto`, `auto_events`, `auto_event`, `programados` | Activa el programador automático de Happy Hours rotativos y auto-raids mientras haya jugadores conectados. |
 | `shiny_event` | `OFF` (`False`) | `shiny`, `shiny_event`, `charm` | Al activarlo, entrega un **Lumiose Shiny Charm** en la mochila de los jugadores conectados (y el Día 1 de racha diaria también entrega Charm mientras siga activo). |
 | `instant_hatch` | `OFF` (`False`) | `hatch`, `instant_hatch`, `instanthatch` | Activa el modo de eclosión instantánea para la Guardería / Huevos. |
 | `double_loot` | `OFF` (`False`) | `loot`, `double_loot`, `doble` | Activa recompensas dobles. |
@@ -60,7 +62,25 @@ Los comandos funcionan desde dos lugares:
 /event hatch on
 /event raids off
 /evento huevos on
+/event auto off
 ```
+
+---
+
+## 3.1 Eventos Automáticos (`/autoevent`)
+
+Cuando `auto_events` está en `ON` y hay jugadores conectados, el servidor ejecuta automáticamente:
+1. **Happy Hours rotativos** (por defecto: cada `45 min` dura `15 min`): rota entre `shiny_event` (Hora Shiny), `instant_hatch` (Guardería Turbo) y `double_loot` (Lluvia de Recompensas).
+2. **Auto-Raids** (por defecto: cada `30 min` si `raids` está en `ON` y no hay otro Boss activo): abre un Raid Boss en el lobby y avisa en el chat.
+
+| Comando | Quién puede usarlo | Qué hace |
+|---|---|---|
+| `/autoevent` o `/autoevent status` | Todos | Muestra el estado actual, cuánto falta para el próximo evento y el intervalo configurado. |
+| `/autoevent now` (`next`, `ya`) | Admin / Consola | Dispara de inmediato el siguiente Happy Hour de la rotación. |
+| `/autoevent stop` | Admin / Consola | Finaliza antes de tiempo el Happy Hour activo en ese momento. |
+| `/autoevent interval <min>` | Admin / Consola | Cambia cada cuántos minutos se activa un Happy Hour (`1` a `1440`). |
+| `/autoevent duration <min>` | Admin / Consola | Cambia cuántos minutos dura cada Happy Hour (`1` a `240`). |
+| `/autoevent raid <min>` | Admin / Consola | Cambia cada cuántos minutos aparece un Auto-Raid (`0` desactiva solo los auto-raids; `1` a `1440`). |
 
 ---
 

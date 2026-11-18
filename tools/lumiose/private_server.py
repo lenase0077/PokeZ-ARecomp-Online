@@ -518,7 +518,11 @@ class LumiosePrivateServer:
             self.authorized_addrs.pop(addr, None)
         if stale:
             out.extend(self.flush_snapshots(now, force=True))
+        out.extend(self.tick())
         return out
+
+    def tick(self) -> list[tuple[tuple[str, int], bytes]]:
+        return self.extensions.tick(self.players)
 
     def flush_snapshots(
         self, now: float | None = None, *, force: bool = False

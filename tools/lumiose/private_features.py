@@ -617,3 +617,6 @@ class RoomExtensions:
 
     def handle_console_command(self, line: str, players_by_pid: dict[int, object]) -> tuple[list[tuple[tuple[str, int], bytes]], str]:
         return self.coop.handle_console_command(line, players_by_pid)
+
+    def tick(self, players_by_pid: dict[int, object]) -> list[tuple[tuple[str, int], bytes]]:
+        return self.coop.tick(players_by_pid)

@@ -49,10 +49,22 @@ MAX_RAID_TICKETS = 10
 MAX_NURSERY_SLOTS = 8
 DEFAULT_EGG_HATCH_SECS = 60
 
+DEFAULT_AUTO_INTERVAL_SECS = 45 * 60
+DEFAULT_AUTO_DURATION_SECS = 15 * 60
+DEFAULT_AUTO_RAID_SECS = 30 * 60
+
+AUTO_EVENT_ROTATION: tuple[str, ...] = ('shiny_event', 'instant_hatch', 'double_loot')
+AUTO_EVENT_LABELS: dict[str, str] = {
+    'shiny_event': 'Hora Shiny (Shiny Charm)',
+    'instant_hatch': 'Guarderia Turbo (Eclosion instantanea)',
+    'double_loot': 'Lluvia de Recompensas (Loot x2)',
+}
+
 DEFAULT_EVENTS: dict[str, bool] = {
     'raids': True,
     'nursery': True,
     'mystery_gift': True,
+    'auto_events': True,
     'shiny_event': False,
     'instant_hatch': False,
     'double_loot': False,
@@ -71,6 +83,10 @@ EVENT_ALIASES: dict[str, str] = {
     'mystery': 'mystery_gift',
     'mystery_gift': 'mystery_gift',
     'regalo': 'mystery_gift',
+    'auto': 'auto_events',
+    'auto_events': 'auto_events',
+    'auto_event': 'auto_events',
+    'programados': 'auto_events',
     'shiny': 'shiny_event',
     'shiny_event': 'shiny_event',
     'charm': 'shiny_event',
@@ -104,6 +120,15 @@ DEFAULT_GIFTS: dict[str, dict] = {
         'active': True,
         'claimed_by': [],
     },
+}
+
+RAID_SPECIES_NAMES: dict[int, str] = {
+    94: 'Gengar',
+    130: 'Gyarados',
+    445: 'Garchomp',
+    609: 'Chandelure',
+    681: 'Aegislash',
+    706: 'Goodra',
 }
 
 # Curated Raid Boss presets (species, form, level, type1, type2, weak_mask, category, max_hp, spawner_key)
@@ -216,11 +241,31 @@ class CoopHub:
         self._next_nursery_txn = 500
         self.pending_nursery_txns: dict[int, tuple[int, str, str, int]] = {}
 
+        # Automatic scheduled events & raids
+        self.auto_interval_secs: int = DEFAULT_AUTO_INTERVAL_SECS
+        self.auto_duration_secs: int = DEFAULT_AUTO_DURATION_SECS
+        self.auto_raid_secs: int = DEFAULT_AUTO_RAID_SECS
+        self.auto_idx: int = 0
+        self.auto_active_event: str | None = None
+        self.auto_ends_at: float = 0.0
+        self.auto_next_event_at: float = 0.0
+        self.auto_next_raid_at: float = 0.0
+
     def export_state(self) -> dict:
         return {
             'events': dict(self.events),
             'gifts': self.gifts,
             'admins': sorted(self.admins),
+            'auto': {
+                'interval_secs': self.auto_interval_secs,
+                'duration_secs': self.auto_duration_secs,
+                'raid_secs': self.auto_raid_secs,
+                'idx': self.auto_idx,
+                'active_event': self.auto_active_event,
+                'ends_at': self.auto_ends_at,
+                'next_event_at': self.auto_next_event_at,
+                'next_raid_at': self.auto_next_raid_at,
+            },
         }
 
     def load_state(self, raw: dict | None) -> None:
@@ -252,6 +297,21 @@ class CoopHub:
         admins = raw.get('admins')
         if isinstance(admins, list):
             self.admins = {str(a) for a in admins if isinstance(a, str)}
+        auto = raw.get('auto')
+        if isinstance(auto, dict):
+            self.auto_interval_secs = max(60, int(auto.get('interval_secs', DEFAULT_AUTO_INTERVAL_SECS)))
+            self.auto_duration_secs = max(60, int(auto.get('duration_secs', DEFAULT_AUTO_DURATION_SECS)))
+            self.auto_raid_secs = max(0, int(auto.get('raid_secs', DEFAULT_AUTO_RAID_SECS)))
+            self.auto_idx = max(0, int(auto.get('idx', 0)))
+            active = auto.get('active_event')
+            if isinstance(active, str) and active in AUTO_EVENT_ROTATION and self.events.get(active, False):
+                self.auto_active_event = active
+                self.auto_ends_at = float(auto.get('ends_at', 0.0))
+            else:
+                self.auto_active_event = None
+                self.auto_ends_at = 0.0
+            self.auto_next_event_at = float(auto.get('next_event_at', 0.0))
+            self.auto_next_raid_at = float(auto.get('next_raid_at', 0.0))
 
     def is_event_on(self, name: str) -> bool:
         return bool(self.events.get(name, False))
@@ -936,10 +996,127 @@ class CoopHub:
             ]
         return []
 
-    # --- Chat & Console Commands ---
+    # --- Chat, Automatic Scheduler & Console Commands ---
     def _format_events_line(self) -> str:
         parts = [f'{k}={"ON" if v else "OFF"}' for k, v in sorted(self.events.items())]
         return 'Eventos: ' + ', '.join(parts)
+
+    def _apply_event_change(
+        self,
+        ev_key: str,
+        enabled: bool,
+        players_by_pid: dict[int, object],
+        *,
+        notice: str,
+    ) -> list[tuple[tuple[str, int], bytes]]:
+        """Persist event toggle and push updated settings, raid access, and shiny charm."""
+        self.events[ev_key] = enabled
+        out: list[tuple[tuple[str, int], bytes]] = []
+        for p in players_by_pid.values():
+            rec = self._ensure_record(p.trainer_id, p.name)
+            out.append((p.addr, self.build_settings_packet(p.token)))
+            out.append((p.addr, build_server_notice(p.token, notice)))
+            if ev_key == 'raids':
+                out.append((p.addr, self.build_raid_ticket_packet(p.token, 0, action=2, status=1 if enabled else 0, tickets=rec.raid_tickets)))
+            if ev_key == 'shiny_event' and enabled:
+                rec.bag['1'] = min(99, rec.bag.get('1', 0) + 1)
+                out.append((p.addr, self._build_bag_packet(p.token, rec)))
+        self._save()
+        return out
+
+    def _stop_auto_bonus(
+        self,
+        players_by_pid: dict[int, object],
+        now: float,
+        *,
+        notice_prefix: str = '[AUTO] Finalizo',
+    ) -> list[tuple[tuple[str, int], bytes]]:
+        ev_key = self.auto_active_event
+        if not ev_key:
+            return []
+        self.auto_active_event = None
+        self.auto_ends_at = 0.0
+        self.auto_next_event_at = now + self.auto_interval_secs
+        label = AUTO_EVENT_LABELS.get(ev_key, ev_key)
+        return self._apply_event_change(ev_key, False, players_by_pid, notice=f'{notice_prefix} {label}.')
+
+    def _start_auto_bonus(
+        self,
+        players_by_pid: dict[int, object],
+        now: float,
+    ) -> tuple[list[tuple[tuple[str, int], bytes]], str]:
+        out: list[tuple[tuple[str, int], bytes]] = []
+        if self.auto_active_event is not None:
+            out.extend(self._stop_auto_bonus(players_by_pid, now, notice_prefix='[AUTO] Cambio de evento, finalizo'))
+        ev_key = AUTO_EVENT_ROTATION[self.auto_idx % len(AUTO_EVENT_ROTATION)]
+        self.auto_idx = (self.auto_idx + 1) % len(AUTO_EVENT_ROTATION)
+        self.auto_active_event = ev_key
+        self.auto_ends_at = now + self.auto_duration_secs
+        self.auto_next_event_at = self.auto_ends_at + self.auto_interval_secs
+        dur_min = max(1, round(self.auto_duration_secs / 60))
+        label = AUTO_EVENT_LABELS.get(ev_key, ev_key)
+        notice = f'[AUTO] Happy Hour: {label} activo por {dur_min} min!'
+        out.extend(self._apply_event_change(ev_key, True, players_by_pid, notice=notice))
+        return out, notice
+
+    def _format_auto_status(self, now: float) -> str:
+        state = 'ON' if self.is_event_on('auto_events') else 'OFF'
+        int_m = max(1, round(self.auto_interval_secs / 60))
+        dur_m = max(1, round(self.auto_duration_secs / 60))
+        raid_m = round(self.auto_raid_secs / 60) if self.auto_raid_secs > 0 else 0
+        if self.auto_active_event:
+            rem_m = max(0, int((self.auto_ends_at - now + 59) // 60))
+            bonus_txt = f'activo={self.auto_active_event} ({rem_m}m)'
+        elif self.auto_next_event_at > now:
+            wait_m = max(1, int((self.auto_next_event_at - now + 59) // 60))
+            bonus_txt = f'proximo en {wait_m}m'
+        else:
+            bonus_txt = 'esperando jugadores'
+        raid_txt = f'{raid_m}m' if raid_m > 0 else 'OFF'
+        return f'AutoEventos={state} ({bonus_txt}) | cada {int_m}m x {dur_m}m | auto-raid={raid_txt}'
+
+    def tick(self, players_by_pid: dict[int, object]) -> list[tuple[tuple[str, int], bytes]]:
+        """Advance automatic rotating bonus events and automatic raid spawns."""
+        now = self.wall_clock()
+        out: list[tuple[tuple[str, int], bytes]] = []
+
+        if self.auto_active_event is not None and now >= self.auto_ends_at:
+            out.extend(self._stop_auto_bonus(players_by_pid, now))
+
+        if not self.is_event_on('auto_events') or not players_by_pid:
+            return out
+
+        dirty = False
+        if self.auto_next_event_at <= 0.0:
+            self.auto_next_event_at = now + self.auto_interval_secs
+            dirty = True
+        if self.auto_raid_secs > 0 and self.auto_next_raid_at <= 0.0:
+            self.auto_next_raid_at = now + self.auto_raid_secs
+            dirty = True
+
+        if self.auto_active_event is None and now >= self.auto_next_event_at:
+            bonus_out, _ = self._start_auto_bonus(players_by_pid, now)
+            out.extend(bonus_out)
+            dirty = False
+
+        if self.auto_raid_secs > 0 and self.is_event_on('raids'):
+            if self.active_raid is not None and self.active_raid.active:
+                self.auto_next_raid_at = now + self.auto_raid_secs
+            elif now >= self.auto_next_raid_at:
+                driver = next(iter(players_by_pid), 1)
+                out.extend(self.spawn_new_raid(driver, players_by_pid, start_now=False))
+                boss = self.active_raid
+                if boss is not None:
+                    sname = RAID_SPECIES_NAMES.get(boss.species, f'#{boss.species}')
+                    notice = f'[AUTO] Raid Boss disponible: {sname} Nv.{boss.level}!'
+                    for p in players_by_pid.values():
+                        out.append((p.addr, build_server_notice(p.token, notice)))
+                self.auto_next_raid_at = now + self.auto_raid_secs
+                dirty = True
+
+        if dirty:
+            self._save()
+        return out
 
     def _apply_command(
         self,
@@ -958,16 +1135,57 @@ class CoopHub:
         args = parts[1:]
 
         if cmd in ('help', 'ayuda', '?'):
-            msg = 'Comandos: /events | /event <nombre> <on|off> | /gift <list|add|del> | /charm | /tickets | /raid <spawn|clear> | /say <msg>'
+            msg = 'Comandos: /events | /event <nombre> <on|off> | /autoevent [now|stop|interval|duration|raid] | /gift | /charm | /tickets | /raid | /say'
             return ([(sender.addr, build_server_notice(sender.token, msg))] if sender else []), msg
 
         if cmd in ('events', 'eventos'):
             msg = self._format_events_line()
             return ([(sender.addr, build_server_notice(sender.token, msg))] if sender else []), msg
 
+        if cmd in ('autoevent', 'autoevents'):
+            now = self.wall_clock()
+            sub = args[0].lower() if args else 'status'
+            if sub == 'status':
+                msg = self._format_auto_status(now)
+                return ([(sender.addr, build_server_notice(sender.token, msg))] if sender else []), msg
+            if sub in ('now', 'next', 'ya'):
+                if not self.is_event_on('auto_events'):
+                    self.events['auto_events'] = True
+                out, msg = self._start_auto_bonus(players_by_pid, now)
+                return out, msg
+            if sub in ('stop', 'clear'):
+                if self.auto_active_event is None:
+                    msg = 'No hay ningun evento automatico activo ahora.'
+                    return ([(sender.addr, build_server_notice(sender.token, msg))] if sender else []), msg
+                out = self._stop_auto_bonus(players_by_pid, now, notice_prefix='[AUTO] Detenido:')
+                msg = 'Evento automatico detenido.'
+                return out, msg
+            if sub == 'interval' and len(args) >= 2 and args[1].isdigit():
+                mins = max(1, min(1440, int(args[1])))
+                self.auto_interval_secs = mins * 60
+                self.auto_next_event_at = now + self.auto_interval_secs
+                self._save()
+                msg = f'[AUTO] Intervalo de eventos configurado cada {mins} min.'
+                return [(p.addr, build_server_notice(p.token, msg)) for p in players_by_pid.values()], msg
+            if sub == 'duration' and len(args) >= 2 and args[1].isdigit():
+                mins = max(1, min(240, int(args[1])))
+                self.auto_duration_secs = mins * 60
+                self._save()
+                msg = f'[AUTO] Duracion de eventos configurada en {mins} min.'
+                return [(p.addr, build_server_notice(p.token, msg)) for p in players_by_pid.values()], msg
+            if sub == 'raid' and len(args) >= 2 and args[1].isdigit():
+                mins = max(0, min(1440, int(args[1])))
+                self.auto_raid_secs = mins * 60
+                self.auto_next_raid_at = (now + self.auto_raid_secs) if mins > 0 else 0.0
+                self._save()
+                msg = '[AUTO] Auto-raids desactivados.' if mins == 0 else f'[AUTO] Auto-raids cada {mins} min.'
+                return [(p.addr, build_server_notice(p.token, msg)) for p in players_by_pid.values()], msg
+            msg = 'Uso: /autoevent [status|now|stop|interval <min>|duration <min>|raid <min>]'
+            return ([(sender.addr, build_server_notice(sender.token, msg))] if sender else []), msg
+
         if cmd in ('event', 'evento'):
             if len(args) < 2:
-                msg = 'Uso: /event <raids|nursery|gift|shiny|hatch|loot> <on|off>'
+                msg = 'Uso: /event <raids|nursery|gift|auto|shiny|hatch|loot> <on|off>'
                 return ([(sender.addr, build_server_notice(sender.token, msg))] if sender else []), msg
             a0, a1 = args[0].lower(), args[1].lower()
             if a0 in ('on', 'off', '1', '0', 'si', 'no'):
@@ -980,21 +1198,22 @@ class CoopHub:
                 return ([(sender.addr, build_server_notice(sender.token, msg))] if sender else []), msg
 
             enabled = state_tok in ('on', '1', 'si', 'true')
-            self.events[ev_key] = enabled
-            self._save()
-            notice = f'[EVENTO] {ev_key} -> {"ACTIVADO" if enabled else "DESACTIVADO"}'
+            now = self.wall_clock()
             out: list[tuple[tuple[str, int], bytes]] = []
-            for p in players_by_pid.values():
-                rec = self._ensure_record(p.trainer_id, p.name)
-                out.append((p.addr, self.build_settings_packet(p.token)))
-                out.append((p.addr, build_server_notice(p.token, notice)))
-                if ev_key == 'raids':
-                    out.append((p.addr, self.build_raid_ticket_packet(p.token, 0, action=2, status=1 if enabled else 0, tickets=rec.raid_tickets)))
-                if ev_key == 'shiny_event' and enabled:
-                    rec.bag['1'] = min(99, rec.bag.get('1', 0) + 1)
-                    out.append((p.addr, self._build_bag_packet(p.token, rec)))
-            if ev_key == 'shiny_event' and enabled:
-                self._save()
+            if ev_key == 'auto_events':
+                if enabled:
+                    self.auto_next_event_at = now + self.auto_interval_secs
+                    if self.auto_raid_secs > 0:
+                        self.auto_next_raid_at = now + self.auto_raid_secs
+                elif self.auto_active_event is not None:
+                    out.extend(self._stop_auto_bonus(players_by_pid, now, notice_prefix='[AUTO] Detenido:'))
+            elif not enabled and self.auto_active_event == ev_key:
+                self.auto_active_event = None
+                self.auto_ends_at = 0.0
+                self.auto_next_event_at = now + self.auto_interval_secs
+
+            notice = f'[EVENTO] {ev_key} -> {"ACTIVADO" if enabled else "DESACTIVADO"}'
+            out.extend(self._apply_event_change(ev_key, enabled, players_by_pid, notice=notice))
             return out, notice
 
         if cmd == 'gift':
@@ -1061,7 +1280,11 @@ class CoopHub:
             driver = sender.pid if sender is not None else next(iter(players_by_pid), 1)
             out = self.spawn_new_raid(driver, players_by_pid, start_now=True)
             boss = self.active_raid
-            msg = f'[RAID] Aparecio Boss Nv.{boss.level} (especie #{boss.species}, HP {boss.max_hp})!' if boss else 'Raid iniciado.'
+            if boss:
+                sname = RAID_SPECIES_NAMES.get(boss.species, f'#{boss.species}')
+                msg = f'[RAID] Aparecio {sname} Nv.{boss.level} (HP {boss.max_hp})!'
+            else:
+                msg = 'Raid iniciado.'
             for p in players_by_pid.values():
                 out.append((p.addr, build_server_notice(p.token, msg)))
             return out, msg
@@ -1098,8 +1321,10 @@ class CoopHub:
                 if (m := players_by_pid.get(mpid)) is not None and m.pid != player.pid
             ]
 
-        cmd_head = text[1:].split()[0].lower() if text[1:].strip() else ''
-        if cmd_head in ('help', 'ayuda', '?', 'events', 'eventos') or self.is_admin(player):
+        cmd_parts = text[1:].split()
+        cmd_head = cmd_parts[0].lower() if cmd_parts else ''
+        is_public_auto = cmd_head in ('autoevent', 'autoevents') and (len(cmd_parts) == 1 or cmd_parts[1].lower() == 'status')
+        if cmd_head in ('help', 'ayuda', '?', 'events', 'eventos') or is_public_auto or self.is_admin(player):
             replies, _ = self._apply_command(text, players_by_pid, sender=player)
             return replies
         return [(player.addr, build_server_notice(player.token, 'Solo el host puede usar comandos de admin.'))]

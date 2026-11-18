@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "../../paths.h"
+#include "../../input_bind.h"
 #include "../../platform.h"
 #include "../../rt.h"  // (HEAP_MAX: lazy_heap_predicted)
 #include "../../settings.h"
@@ -2373,6 +2374,7 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
         if (menu_at && (long)frame + 1 == menu_at) { extern void menu_test_open(void); menu_test_open(); }
         // (ImGui records through vk_overlay_begin / vk_overlay_end, when it draws anything)
         vk_hdr_mark_base();
+        menu_set_game_viewport((float)vx, (float)vy, (float)vw, (float)vh);
         menu_render((void *)cb, g_vk.sc_extent.width, g_vk.sc_extent.height);
         pp_mark(PP_OVERLAY);
         static long win_shot = -1;
@@ -2763,11 +2765,16 @@ int ui_run(void) {
                 input_rumble_stop();
                 input_led_stop();
                 LOG("window closed\n");
+#ifdef _WIN32
+                extern void plat_shutdown_watchdog_start(void);
+                plat_shutdown_watchdog_start();
+#endif
                 backend_quit();  // (before exit(): see there)
                 exit(0);
             }
             extern bool input_user_blocked(const SDL_Event *e);
             if (input_user_blocked(&e)) continue;  // scripted test runs: the real keyboard / mouse / pads do nothing (as metal.m)
+            input_note_prompt_event(&e);
             input_cursor_event(&e);
             atomic_store(&ui_stage, "menu_handle_event");
             if (menu_handle_event(&e)) continue;

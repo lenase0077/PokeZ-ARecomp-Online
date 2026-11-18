@@ -643,8 +643,16 @@ NVN(nvnTextureWriteTexels) {
         tegra_swizzle(AP(3), (uint8_t *)(uintptr_t)t->addr + l.offset, l.wb, l.hb, r[5] > 0 ? (uint32_t)r[5] : 1,
                       t->layout.fmt->bpb, l.block_height_log2, l.block_depth_log2);
         backend_pool_written(t->addr, tegra_total_size(&t->layout));
+    } else if (r && !A(1) && A(3) && t->layout.fmt && t->layout.fmt->bw == 1 && t->layout.fmt->bh == 1 &&
+               t->layout.depth == 1 && t->layout.layers <= 1 && r[0] >= 0 && r[1] >= 0 && r[2] == 0 &&
+               r[3] > 0 && r[4] > 0 && r[5] == 1 && (uint32_t)r[0] < l.w && (uint32_t)r[1] < l.h &&
+               (uint32_t)r[3] <= l.w - (uint32_t)r[0] && (uint32_t)r[4] <= l.h - (uint32_t)r[1]) {
+        tegra_swizzle_rect(AP(3), (uint8_t *)(uintptr_t)t->addr + l.offset, l.w, l.h,
+                           (uint32_t)r[0], (uint32_t)r[1], (uint32_t)r[3], (uint32_t)r[4],
+                           t->layout.fmt->bpb, l.block_height_log2);
+        backend_pool_written(t->addr, tegra_total_size(&t->layout));
     } else {
-        LOG("[nvn] partial WriteTexels not implemented\n");
+        LOG("[nvn] unsupported partial WriteTexels region\n");
     }
 }
 NVN(nvnTextureWriteTexelsStrided) { LOG("[nvn] WriteTexelsStrided not implemented\n"); (void)c; }

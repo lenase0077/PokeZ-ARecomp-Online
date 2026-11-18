@@ -15,6 +15,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import invite_code
+import private_coop as pc
 import private_features as pf
 import private_server as ps
 import profiles
@@ -559,6 +560,177 @@ class ExtensionProtocolTests(unittest.TestCase):
             # Activating while already active returns code=5
             r_use2 = srv.handle_packet(use_pkt, addr, now=11.0)
             self.assertEqual(r_use2[0][1][12], 5)
+
+
+class CoopAndEventsTests(unittest.TestCase):
+    def _join(self, srv: ps.LumiosePrivateServer, tid: bytes, name: bytes, addr: tuple[str, int]):
+        replies = srv.handle_packet(make_hello(tid, name), addr, now=1.0)
+        welcome = next(p for d, p in replies if d == addr and p[3] == ps.PKT_WELCOME)
+        token = struct.unpack_from('<I', welcome, 4)[0]
+        pid = struct.unpack_from('<H', welcome, 16)[0]
+        return pid, token, replies
+
+    def _chat(self, tok: int, text: bytes) -> bytes:
+        return ps.pack_header(ps.PKT_CHAT, tok) + bytes([1, len(text)]) + text
+
+    def test_market_disabled_and_mystery_gift_with_event_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / 'private-room-state.json'
+            srv = ps.LumiosePrivateServer(state_path=state_file, wall_clock=lambda: 1794960000.0)
+            addr_a = ('127.0.0.1', 40301)
+            addr_b = ('190.22.219.1', 40302)
+            pid_a, tok_a, join_a = self._join(srv, b'M' * 14, b'Leandro', addr_a)
+            self._join(srv, b'N' * 14, b'Amorcito', addr_b)
+
+            # Market probe (0x68) never returns 0xE8 (market stays disabled)
+            for op in (0x68, 0x69, 0x6E):
+                res_m = srv.handle_packet(ps.pack_header(op, tok_a) + b'\x01\x00', addr_a, now=2.0)
+                self.assertEqual(res_m, [])
+            self.assertTrue(any(p[3] == pf.PKT_EXTENSION_IN and p[8] == pc.RX_SUBOP_SETTINGS for _, p in join_a))
+
+            # Redeem built-in SHINYZA mystery gift -> FC 19 code=0 (success green) + Lumiose Bag charm
+            gift_pkt = ps.pack_header(pf.PKT_EXTENSION, tok_a) + struct.pack('<BBBHBBB', pc.TX_SUBOP_MYSTERY_GIFT, 0, 0, 12, 1, 1, len(b'SHINYZA')) + b'SHINYZA'
+            r_gift = srv.handle_packet(gift_pkt, addr_a, now=2.1)
+            fc19 = next(p for _, p in r_gift if p[3] == pf.PKT_EXTENSION_IN and p[8] == pc.RX_SUBOP_MYSTERY_GIFT)
+            fc16 = next(p for _, p in r_gift if p[3] == pf.PKT_EXTENSION_IN and p[8] == pf.SUBOP_LUMIOSE_BAG)
+            ver, req_id, code, mlen = struct.unpack_from('<BHBH', fc19, 9)
+            self.assertEqual((ver, req_id, code), (1, 12, 0))
+            self.assertIn(b'Lumiose Shiny Charm', fc19[15 : 15 + mlen])
+            self.assertEqual(fc16[15], 1)
+
+            # Duplicate claim -> code=1
+            r_dup = srv.handle_packet(gift_pkt, addr_a, now=2.2)
+            self.assertEqual(r_dup[0][1][12], 1)
+
+            # Admin toggles mystery_gift off via chat command -> not broadcast to chat, notifies both, blocks gift
+            r_cmd = srv.handle_packet(self._chat(tok_a, b'/event mystery_gift off'), addr_a, now=2.3)
+            self.assertTrue(any(d == addr_b and p[3] == ps.PKT_CHAT_IN and b'DESACTIVADO' in p for d, p in r_cmd))
+            r_off = srv.handle_packet(gift_pkt, addr_a, now=2.4)
+            self.assertEqual(r_off[0][1][12], 2)
+
+            # Console command creates a custom gift code and re-enables event; persists across restart
+            srv.handle_console_command('event mystery_gift on')
+            srv.handle_console_command('gift add AMORVIP tickets 4')
+            srv2 = ps.LumiosePrivateServer(state_path=state_file, wall_clock=lambda: 1794960000.0)
+            self.assertTrue(srv2.extensions.coop.is_event_on('mystery_gift'))
+            self.assertIn('AMORVIP', srv2.extensions.coop.gifts)
+
+    def test_party_lifecycle_and_party_chat(self):
+        srv = ps.LumiosePrivateServer(wall_clock=lambda: 1794960000.0)
+        addr_a = ('127.0.0.1', 40401)
+        addr_b = ('190.22.219.1', 40402)
+        pid_a, tok_a, _ = self._join(srv, b'P' * 14, b'Leandro', addr_a)
+        pid_b, tok_b, _ = self._join(srv, b'Q' * 14, b'Amorcito', addr_b)
+
+        # A invites B (7D 28 00 00 req_id ver=1 act=1 target_pid=B)
+        inv_pkt = ps.pack_header(pf.PKT_EXTENSION, tok_a) + struct.pack('<BBBHBBB', pc.TX_SUBOP_PARTY, 0, 0, 5, 1, 1, pid_b)
+        r_inv = srv.handle_packet(inv_pkt, addr_a, now=2.0)
+        fc30_b = next(p for d, p in r_inv if d == addr_b and p[3] == pf.PKT_EXTENSION_IN and p[8] == pc.RX_SUBOP_PARTY)
+        self.assertEqual(fc30_b[9:11], bytes([1, 2]))  # ver=1, msg_type=2 invite received
+        invite_id = struct.unpack_from('<I', fc30_b, 11)[0]
+
+        # B accepts (act=2, invite_id, accept=1)
+        acc_pkt = ps.pack_header(pf.PKT_EXTENSION, tok_b) + struct.pack('<BBBHBB', pc.TX_SUBOP_PARTY, 0, 0, 6, 1, 2) + struct.pack('<IB', invite_id, 1)
+        r_acc = srv.handle_packet(acc_pkt, addr_b, now=2.1)
+        roster_a = next(p for d, p in r_acc if d == addr_a and p[3] == pf.PKT_EXTENSION_IN and p[8] == pc.RX_SUBOP_PARTY and p[10] != 3)
+        self.assertEqual(roster_a[21], 2)  # 2 members in party
+
+        # Party chat /p goes only to B
+        r_pchat = srv.handle_packet(self._chat(tok_a, b'/p Vamos al raid!'), addr_a, now=2.2)
+        self.assertEqual(len(r_pchat), 1)
+        self.assertEqual(r_pchat[0][0], addr_b)
+        self.assertIn(b'Vamos al raid!', r_pchat[0][1])
+
+        # B leaves (act=3) -> party disbanded cleanly
+        leave_pkt = ps.pack_header(pf.PKT_EXTENSION, tok_b) + struct.pack('<BBBHBB', pc.TX_SUBOP_PARTY, 0, 0, 7, 1, 3)
+        r_leave = srv.handle_packet(leave_pkt, addr_b, now=2.3)
+        roster_a2 = next(p for d, p in r_leave if d == addr_a and p[3] == pf.PKT_EXTENSION_IN and p[8] == pc.RX_SUBOP_PARTY)
+        self.assertEqual(roster_a2[21], 0)
+
+    def test_raids_tickets_lobby_combat_and_toggle(self):
+        srv = ps.LumiosePrivateServer(wall_clock=lambda: 1794960000.0)
+        addr_a = ('127.0.0.1', 40501)
+        addr_b = ('190.22.219.1', 40502)
+        _, tok_a, _ = self._join(srv, b'R' * 14, b'Leandro', addr_a)
+        _, tok_b, _ = self._join(srv, b'S' * 14, b'Amorcito', addr_b)
+
+        # Toggle double_loot on via chat command
+        srv.handle_packet(self._chat(tok_a, b'/event double_loot on'), addr_a, now=2.0)
+
+        # Buy Raid Ticket (0x7D 0x29) -> increments ticket count
+        buy_pkt = ps.pack_header(pf.PKT_EXTENSION, tok_a) + struct.pack('<BBBHBBB', pc.TX_SUBOP_RAID_TICKET, 0, 0, 11, 1, 1, 0)
+        r_buy = srv.handle_packet(buy_pkt, addr_a, now=2.1)
+        tkt_pkt = next(p for _, p in r_buy if p[3] == pf.PKT_EXTENSION_IN and p[8] == pc.RX_SUBOP_RAID_TICKET and p[12] == 1)
+        self.assertEqual(tkt_pkt[14], 2)  # started with 1, now 2
+
+        # Start raid (0x7D 0x1D act=4) -> spawns Boss for both A and B (0xFC 0x2E msg_type=5 & 1)
+        start_pkt = ps.pack_header(pf.PKT_EXTENSION, tok_a) + struct.pack('<BBBHB', pc.TX_SUBOP_RAID_LOBBY, 0, 0, 12, 4)
+        r_start = srv.handle_packet(start_pkt, addr_a, now=2.2)
+        spawn_a = next(p for d, p in r_start if d == addr_a and p[3] == pf.PKT_EXTENSION_IN and p[8] == pc.RX_SUBOP_RAID_BOSS and p[10] == 1)
+        spawn_b = next(p for d, p in r_start if d == addr_b and p[3] == pf.PKT_EXTENSION_IN and p[8] == pc.RX_SUBOP_RAID_BOSS and p[10] == 1)
+        rid = struct.unpack_from('<I', spawn_a, 11)[0]
+        self.assertGreater(rid, 0)
+        self.assertEqual(struct.unpack_from('<I', spawn_b, 11)[0], rid)
+
+        # Defeat boss via 0x7D 0x26 hit -> ends raid and awards double_loot bonus charm + tickets
+        hit_pkt = ps.pack_header(pf.PKT_EXTENSION, tok_b) + struct.pack('<BBBBBBBIHH', pc.TX_SUBOP_RAID_COMBAT, 0, 0, 0, 0, 2, 1, rid, 1, 9999)
+        r_hit = srv.handle_packet(hit_pkt, addr_b, now=2.3)
+        end_b = next(p for d, p in r_hit if d == addr_b and p[3] == pf.PKT_EXTENSION_IN and p[8] == pc.RX_SUBOP_RAID_BOSS and p[10] == 3)
+        self.assertEqual(end_b[16], 2)  # double reward=2
+        self.assertTrue(any(d == addr_b and p[3] == pf.PKT_EXTENSION_IN and p[8] == pf.SUBOP_LUMIOSE_BAG for d, p in r_hit))
+
+        # Turning raids off pushes disabled flag in 0xFC 0x31
+        r_off = srv.handle_packet(self._chat(tok_a, b'/event raids off'), addr_a, now=2.4)
+        off_b = next(p for d, p in r_off if d == addr_b and p[3] == pf.PKT_EXTENSION_IN and p[8] == pc.RX_SUBOP_RAID_TICKET and p[12] == 2)
+        self.assertEqual(off_b[13], 0)
+
+    def test_nursery_eggs_upload_claim_and_instant_hatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / 'private-room-state.json'
+            wall = [1794960000.0]
+            srv = ps.LumiosePrivateServer(state_path=state_file, wall_clock=lambda: wall[0])
+            addr = ('127.0.0.1', 40601)
+            _, tok, _ = self._join(srv, b'E' * 14, b'Criador', addr)
+
+            # 0x46 upload (3 x 344B PKM blocks) -> lays egg in nursery
+            pkm_parent1 = b'\x11' * pc.PKM_BLOCK_SIZE
+            pkm_parent2 = b'\x22' * pc.PKM_BLOCK_SIZE
+            pkm_egg = b'\xE9' * pc.PKM_BLOCK_SIZE
+            upload_pkt = (
+                ps.pack_header(pc.PKT_DAYCARE_UPLOAD, tok)
+                + struct.pack('<HIB', 3, 500, 0)
+                + struct.pack('<H', pc.PKM_BLOCK_SIZE) + pkm_parent1
+                + struct.pack('<H', pc.PKM_BLOCK_SIZE) + pkm_parent2
+                + struct.pack('<H', pc.PKM_BLOCK_SIZE) + pkm_egg
+            )
+            r_up = srv.handle_packet(upload_pkt, addr, now=2.0)
+            c4 = next(p for _, p in r_up if p[3] == pc.PKT_DAYCARE_SLOTS)
+            c6 = next(p for _, p in r_up if p[3] == pc.PKT_DAYCARE_TXN)
+            self.assertEqual(c4[10], 1)  # 1 slot stored
+            self.assertEqual(c6[10], 0)  # ok code=0
+
+            # Before 60s hatch, claim (cmd=6) returns not-ready message
+            claim_pkt = ps.pack_header(pc.PKT_DAYCARE_ACTION, tok) + struct.pack('<HBII', 4, 6, 0, 0)[:9]
+            r_wait = srv.handle_packet(claim_pkt, addr, now=2.1)
+            self.assertEqual(r_wait[0][1][10], 1)
+            self.assertIn(b'not ready', r_wait[0][1])
+
+            # Turn on instant_hatch event -> claim immediately returns exact 0x158 Egg PKM in 0xC6!
+            srv.handle_console_command('event instant_hatch on')
+            r_take = srv.handle_packet(claim_pkt, addr, now=2.2)
+            c6_egg = r_take[0][1]
+            self.assertEqual(c6_egg[10], 0)
+            msg_len = c6_egg[29]
+            pkm_len = struct.unpack_from('<H', c6_egg, 30 + msg_len)[0]
+            self.assertEqual(pkm_len, pc.PKM_BLOCK_SIZE)
+            self.assertEqual(c6_egg[32 + msg_len : 32 + msg_len + pkm_len], pkm_egg)
+
+            # Settle commit clears slot cleanly and persists
+            txn_id = struct.unpack_from('<I', c6_egg, 12)[0]
+            settle_pkt = ps.pack_header(pc.PKT_DAYCARE_ACTION, tok) + struct.pack('<HBIH', 5, 0x4C, txn_id, 0)
+            r_settle = srv.handle_packet(settle_pkt, addr, now=2.3)
+            c4_after = next(p for _, p in r_settle if p[3] == pc.PKT_DAYCARE_SLOTS)
+            self.assertEqual(c4_after[10], 0)
 
 
 if __name__ == '__main__':

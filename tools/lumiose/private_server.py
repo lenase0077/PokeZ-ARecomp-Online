@@ -5,12 +5,14 @@ import argparse
 from dataclasses import dataclass, field
 import hmac
 from pathlib import Path
+import queue
 import selectors
 import secrets
 import signal
 import socket
 import struct
 import sys
+import threading
 import time
 from typing import Callable
 
@@ -347,6 +349,9 @@ class LumiosePrivateServer:
                 return []
             decoded = msg.decode('utf-8', 'replace')
             self._log(f'chat [{player.name.decode("utf-8", "replace")}]: {decoded}')
+            cmd_replies = self.extensions.handle_chat(msg, player, self.players)
+            if cmd_replies is not None:
+                return cmd_replies
             return [
                 (other.addr, build_chat_in(other.token, player, msg))
                 for other in self.players.values()
@@ -543,6 +548,44 @@ class LumiosePrivateServer:
             )
         return out
 
+    def handle_console_command(self, line: str) -> list[tuple[tuple[str, int], bytes]]:
+        replies, summary = self.extensions.handle_console_command(line, self.players)
+        if summary:
+            self._log(summary)
+        return replies
+
+
+def _send_replies(sock: socket.socket, replies: list[tuple[tuple[str, int], bytes]]) -> None:
+    for dst, payload in replies:
+        try:
+            sock.sendto(payload, dst)
+        except OSError:
+            pass
+
+
+def _start_console_reader() -> queue.SimpleQueue[str] | None:
+    try:
+        if sys.stdin is None or not sys.stdin.isatty():
+            return None
+    except Exception:
+        return None
+    cmd_q: queue.SimpleQueue[str] = queue.SimpleQueue()
+
+    def _reader() -> None:
+        while True:
+            try:
+                line = sys.stdin.readline()
+            except Exception:
+                break
+            if not line:
+                break
+            stripped = line.strip()
+            if stripped:
+                cmd_q.put(stripped)
+
+    threading.Thread(target=_reader, daemon=True, name='lumiose-console').start()
+    return cmd_q
+
 
 def run_server(
     host: str = '0.0.0.0',
@@ -587,11 +630,14 @@ def run_server(
             pass
 
     auth_mode = 'room-code locked' if server.room_secret else 'open'
+    cmd_queue = _start_console_reader()
     print(
         f'[lumiose server] Listening on UDP {bound_host}:{bound_port} '
         f'(max_players={max_players}, access={auth_mode})',
         flush=True,
     )
+    if cmd_queue is not None:
+        print('[lumiose server] Console commands ready (type: events, event <name> <on|off>, gift list, help)', flush=True)
 
     try:
         while running:
@@ -606,27 +652,22 @@ def run_server(
                         break
                     except OSError:
                         break
-                    replies = server.handle_packet(data, addr, time.monotonic())
-                    for dst, payload in replies:
-                        try:
-                            sock.sendto(payload, dst)
-                        except OSError:
-                            pass
+                    _send_replies(sock, server.handle_packet(data, addr, time.monotonic()))
+
+            if cmd_queue is not None:
+                while True:
+                    try:
+                        line = cmd_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    _send_replies(sock, server.handle_console_command(line))
 
             now = time.monotonic()
             if now >= next_tick:
-                for dst, payload in server.flush_snapshots(now):
-                    try:
-                        sock.sendto(payload, dst)
-                    except OSError:
-                        pass
+                _send_replies(sock, server.flush_snapshots(now))
                 next_tick = now + tick_interval
             if now >= next_prune:
-                for dst, payload in server.prune_stale(now):
-                    try:
-                        sock.sendto(payload, dst)
-                    except OSError:
-                        pass
+                _send_replies(sock, server.prune_stale(now))
                 next_prune = now + 1.0
     finally:
         sel.close()

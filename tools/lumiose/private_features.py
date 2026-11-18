@@ -8,6 +8,8 @@ from pathlib import Path
 import struct
 import time
 
+from private_coop import CoopHub, build_server_notice
+
 MAGIC = b'ZA'
 PROTO_VERSION = 1
 
@@ -88,10 +90,12 @@ class TrainerRecord:
     streak_last_ymd: str = ''
     bag: dict[str, int] = field(default_factory=dict)
     active_effects: dict[str, int] = field(default_factory=dict)
+    raid_tickets: int = 1
+    nursery_slots: list[dict] = field(default_factory=list)
 
 
 class RoomExtensions:
-    """Handles Friends, Daily Login Streak, Lumiose Bag, and Ledger ACKs."""
+    """Handles Friends, Daily Login Streak, Bag, Ledger, and Co-op extensions."""
 
     def __init__(
         self,
@@ -104,6 +108,14 @@ class RoomExtensions:
         self.list_rev: int = 1
         self.records: dict[str, TrainerRecord] = {}
         self.pending_requests: dict[tuple[int, int, int], PendingFriendRequest] = {}
+        self.coop = CoopHub(
+            wall_clock=self.wall_clock,
+            ensure_record=self._ensure_record,
+            find_online_by_tid=self._find_online_by_tid,
+            save_state=self._save,
+            build_bag_packet=self.build_bag_packet,
+            records_ref=self.records,
+        )
         self._load()
 
     def _load(self) -> None:
@@ -137,13 +149,17 @@ class RoomExtensions:
                 active_effects={
                     str(k): int(v) for k, v in dict(item.get('active_effects', {})).items()
                 },
+                raid_tickets=max(0, min(10, int(item.get('raid_tickets', 1)))),
+                nursery_slots=[dict(s) for s in item.get('nursery_slots', []) if isinstance(s, dict)],
             )
+        self.coop.load_state(raw.get('coop'))
 
     def _save(self) -> None:
         if self.state_path is None:
             return
         payload = {
             'list_rev': self.list_rev,
+            'coop': self.coop.export_state(),
             'players': {
                 tid: {
                     'name': rec.name,
@@ -154,6 +170,8 @@ class RoomExtensions:
                     'streak_last_ymd': rec.streak_last_ymd,
                     'bag': rec.bag,
                     'active_effects': rec.active_effects,
+                    'raid_tickets': rec.raid_tickets,
+                    'nursery_slots': rec.nursery_slots,
                 }
                 for tid, rec in self.records.items()
             },
@@ -237,7 +255,7 @@ class RoomExtensions:
         rec.streak_day = next_day
         rec.streak_last_ymd = today_str
         reward_item = 0
-        if next_day == STREAK_CYCLE_DAYS:
+        if next_day == STREAK_CYCLE_DAYS or self.coop.is_event_on('shiny_event'):
             reward_item = ITEM_LUMIOSE_SHINY_CHARM
             cur_qty = rec.bag.get(str(ITEM_LUMIOSE_SHINY_CHARM), 0)
             rec.bag[str(ITEM_LUMIOSE_SHINY_CHARM)] = min(99, cur_qty + 1)
@@ -375,6 +393,9 @@ class RoomExtensions:
         out.append((player.addr, self.build_streak_packet(player.token, 4, day, item_id, cooldown)))
         out.append((player.addr, self.build_bag_packet(player.token, rec)))
         out.extend(self._broadcast_friends_sync(rec.trainer_id, players_by_pid, include_self=True))
+        out.extend(self.coop.on_player_join(player, players_by_pid))
+        if self.coop.is_admin(player):
+            out.append((player.addr, build_server_notice(player.token, 'Server listo! Usa /events o /help para ver eventos.')))
         return out
 
     def on_player_leave(
@@ -385,7 +406,7 @@ class RoomExtensions:
         tid = player.trainer_id.hex()
         rec = self.records.get(tid)
         if rec is None:
-            return []
+            return self.coop.on_player_leave(player, players_by_pid)
         _, ymd_tuple, _ = _utc_ymd_and_reset_secs(self.wall_clock())
         rec.last_seen_ymd = list(ymd_tuple)
         self.list_rev = (self.list_rev + 1) & 0xFFFFFFFF or 1
@@ -398,7 +419,9 @@ class RoomExtensions:
         ]
         for k in stale_keys:
             self.pending_requests.pop(k, None)
-        return self._broadcast_friends_sync(tid, players_by_pid, include_self=False)
+        out = self._broadcast_friends_sync(tid, players_by_pid, include_self=False)
+        out.extend(self.coop.on_player_leave(player, players_by_pid))
+        return out
 
     def _build_friend_result(self, token: int, peer_pid: int, req_id: int, code: int, name: bytes) -> bytes:
         cname = sanitize_ascii(name, MAX_FRIEND_NAME_LEN, fallback=b'Trainer')
@@ -551,7 +574,8 @@ class RoomExtensions:
                 return []
             subop = pkt[8]
             if subop != SUBOP_DAILY_STREAK:
-                return []
+                coop_replies = self.coop.handle_extension(subop, pkt, player, players_by_pid)
+                return coop_replies if coop_replies is not None else []
             rec = self._ensure_record(player.trainer_id, player.name)
             # Use Lumiose Bag item: [0x13, 0, 0, 0, 0x00, 0x04, item_lo, item_hi]
             if len(pkt) >= 16 and pkt[12:14] == b'\x00\x04':
@@ -586,4 +610,10 @@ class RoomExtensions:
                     ]
             return []
 
-        return None
+        return self.coop.handle_packet(pkt_type, pkt, player, players_by_pid)
+
+    def handle_chat(self, msg_bytes: bytes, player, players_by_pid: dict[int, object]) -> list[tuple[tuple[str, int], bytes]] | None:
+        return self.coop.handle_chat(msg_bytes, player, players_by_pid)
+
+    def handle_console_command(self, line: str, players_by_pid: dict[int, object]) -> tuple[list[tuple[tuple[str, int], bytes]], str]:
+        return self.coop.handle_console_command(line, players_by_pid)

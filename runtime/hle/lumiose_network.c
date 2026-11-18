@@ -127,9 +127,27 @@ static bool read_address(uint64_t guest, uint64_t size, struct sockaddr_in *out)
     return true;
 }
 
+static bool is_expected_server(const struct sockaddr_in *addr) {
+    const char *spec = getenv("LUMIOSE_TEST_SERVER");
+    char host[64] = "135.148.167.226";
+    uint16_t port = 27777;
+    if (spec && *spec) {
+        const char *colon = strrchr(spec, ':');
+        if (colon && colon > spec && *(colon + 1) && (size_t)(colon - spec) < sizeof(host)) {
+            memcpy(host, spec, (size_t)(colon - spec));
+            host[colon - spec] = '\0';
+            long p = strtol(colon + 1, NULL, 10);
+            if (p > 0 && p <= 65535) port = (uint16_t)p;
+        }
+    }
+    struct in_addr expected_ip;
+    if (inet_pton(AF_INET, host, &expected_ip) != 1) return true;
+    return addr->sin_addr.s_addr == expected_ip.s_addr && addr->sin_port == htons(port);
+}
+
 static bool resolve_server_override(const struct sockaddr_in *expected) {
     const char *spec = getenv("LUMIOSE_SERVER_OVERRIDE");
-    if (!spec || !*spec) return false;
+    if (!spec || !*spec || !is_expected_server(expected)) return false;
 
     const char *colon = strrchr(spec, ':');
     if (!colon || colon == spec || !*(colon + 1)) return false;
@@ -158,6 +176,20 @@ static bool resolve_server_override(const struct sockaddr_in *expected) {
     g_expected_port_be = expected->sin_port;
     g_override_active = true;
     return true;
+}
+
+static void maybe_send_room_knock(SOCKET sock, const struct sockaddr_in *dst, const void *buf, uint64_t len) {
+    if (!buf || len < 130) return;
+    const uint8_t *b = (const uint8_t *)buf;
+    if (b[0] != 'Z' || b[1] != 'A' || b[2] != 1 || b[3] != 1) return;
+    const char *sec = getenv("LUMIOSE_ROOM_SECRET");
+    if (!sec || !*sec) return;
+    char knock[72];
+    size_t slen = strlen(sec);
+    if (slen > 63) slen = 63;
+    memcpy(knock, "ZAKNOCK!", 8);
+    memcpy(knock + 8, sec, slen);
+    sendto(sock, knock, (int)(8 + slen), 0, (const struct sockaddr *)dst, sizeof(*dst));
 }
 
 HLE_FUNC("_ZN2nn6socket6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj", lumiose_socket_send) {
@@ -199,10 +231,15 @@ HLE_FUNC("_ZN2nn6socket6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj", lumiose_soc
         pthread_mutex_lock(&lock);
         if (started && fd >= 0 && fd < LUMIOSE_MAX_SOCKETS && sockets[fd] != INVALID_SOCKET) {
             struct sockaddr_in dst = address;
+            bool redirected = false;
             if ((!g_override_active && resolve_server_override(&address)) ||
                 (g_override_active && address.sin_addr.s_addr == g_expected_addr.s_addr &&
                  address.sin_port == g_expected_port_be)) {
                 dst = g_override_addr;
+                redirected = true;
+            }
+            if (redirected) {
+                maybe_send_room_knock(sockets[fd], &dst, (const void *)(uintptr_t)c->x[1], c->x[2]);
             }
             result = sendto(sockets[fd], (const char *)(uintptr_t)c->x[1], (int)c->x[2], 0,
                             (struct sockaddr *)&dst, sizeof dst);

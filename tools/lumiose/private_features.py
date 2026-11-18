@@ -116,6 +116,41 @@ class RoomExtensions:
             build_bag_packet=self.build_bag_packet,
             records_ref=self.records,
         )
+        try:
+            from .private_world import WorldAndSpawnHub
+        except ImportError:
+            from private_world import WorldAndSpawnHub
+        self.world = WorldAndSpawnHub(
+            wall_clock=self.wall_clock,
+            save_state=self._save,
+            notice_builder=build_server_notice,
+            is_admin_fn=self.coop.is_admin,
+        )
+        try:
+            from .private_economy import MailHub, RaceHub, TradeHub, WonderHub
+        except ImportError:
+            from private_economy import MailHub, RaceHub, TradeHub, WonderHub
+        self.mail = MailHub(
+            wall_clock=self.wall_clock,
+            find_online_by_tid=self._find_online_by_tid,
+            save_state=self._save,
+            records_ref=self.records,
+            notice_builder=build_server_notice,
+        )
+        self.wonder = WonderHub(
+            wall_clock=self.wall_clock,
+            save_state=self._save,
+            mail_hub=self.mail,
+        )
+        self.trade = TradeHub()
+        self.race = RaceHub(
+            wall_clock=self.wall_clock,
+            save_state=self._save,
+            mail_hub=self.mail,
+            records_ref=self.records,
+            notice_builder=build_server_notice,
+            is_admin_fn=self.coop.is_admin,
+        )
         self._load()
 
     def _load(self) -> None:
@@ -153,6 +188,10 @@ class RoomExtensions:
                 nursery_slots=[dict(s) for s in item.get('nursery_slots', []) if isinstance(s, dict)],
             )
         self.coop.load_state(raw.get('coop'))
+        self.world.load_state(raw.get('world'))
+        self.mail.load_state(raw.get('mail'))
+        self.wonder.load_state(raw.get('wonder'))
+        self.race.load_state(raw.get('race'))
 
     def _save(self) -> None:
         if self.state_path is None:
@@ -160,6 +199,10 @@ class RoomExtensions:
         payload = {
             'list_rev': self.list_rev,
             'coop': self.coop.export_state(),
+            'world': self.world.export_state(),
+            'mail': self.mail.export_state(),
+            'wonder': self.wonder.export_state(),
+            'race': self.race.export_state(),
             'players': {
                 tid: {
                     'name': rec.name,
@@ -394,6 +437,9 @@ class RoomExtensions:
         out.append((player.addr, self.build_bag_packet(player.token, rec)))
         out.extend(self._broadcast_friends_sync(rec.trainer_id, players_by_pid, include_self=True))
         out.extend(self.coop.on_player_join(player, players_by_pid))
+        out.extend(self.world.on_player_join(player, players_by_pid))
+        out.extend(self.mail.on_player_join(player, players_by_pid))
+        out.extend(self.race.on_player_join(player, players_by_pid))
         if self.coop.is_admin(player):
             out.append((player.addr, build_server_notice(player.token, 'Server listo! Usa /events o /help para ver eventos.')))
         return out
@@ -421,6 +467,7 @@ class RoomExtensions:
             self.pending_requests.pop(k, None)
         out = self._broadcast_friends_sync(tid, players_by_pid, include_self=False)
         out.extend(self.coop.on_player_leave(player, players_by_pid))
+        out.extend(self.trade.on_player_leave(player, players_by_pid))
         return out
 
     def _build_friend_result(self, token: int, peer_pid: int, req_id: int, code: int, name: bytes) -> bytes:
@@ -574,8 +621,11 @@ class RoomExtensions:
                 return []
             subop = pkt[8]
             if subop != SUBOP_DAILY_STREAK:
-                coop_replies = self.coop.handle_extension(subop, pkt, player, players_by_pid)
-                return coop_replies if coop_replies is not None else []
+                for handler in (self.world, self.wonder, self.race, self.coop):
+                    replies = handler.handle_extension(subop, pkt, player, players_by_pid)
+                    if replies is not None:
+                        return replies
+                return []
             rec = self._ensure_record(player.trainer_id, player.name)
             # Use Lumiose Bag item: [0x13, 0, 0, 0, 0x00, 0x04, item_lo, item_hi]
             if len(pkt) >= 16 and pkt[12:14] == b'\x00\x04':
@@ -610,13 +660,37 @@ class RoomExtensions:
                     ]
             return []
 
-        return self.coop.handle_packet(pkt_type, pkt, player, players_by_pid)
+        for handler in (self.world, self.mail, self.wonder, self.trade, self.race, self.coop):
+            replies = handler.handle_packet(pkt_type, pkt, player, players_by_pid)
+            if replies is not None:
+                return replies
+        return []
 
     def handle_chat(self, msg_bytes: bytes, player, players_by_pid: dict[int, object]) -> list[tuple[tuple[str, int], bytes]] | None:
+        text = msg_bytes.decode('utf-8', 'ignore').strip()
+        if text.startswith('/'):
+            parts = text[1:].split(None, 1)
+            cmd = parts[0].lower() if parts else ''
+            args = parts[1] if len(parts) > 1 else ''
+            for handler in (self.world, self.race):
+                res = handler.handle_command(cmd, args, player, players_by_pid, from_console=False)
+                if res is not None:
+                    return res[0]
         return self.coop.handle_chat(msg_bytes, player, players_by_pid)
 
     def handle_console_command(self, line: str, players_by_pid: dict[int, object]) -> tuple[list[tuple[tuple[str, int], bytes]], str]:
+        text = line.strip()
+        if text.startswith('/'):
+            text = text[1:]
+        if text:
+            parts = text.split(None, 1)
+            cmd = parts[0].lower()
+            args = parts[1] if len(parts) > 1 else ''
+            for handler in (self.world, self.race):
+                res = handler.handle_command(cmd, args, None, players_by_pid, from_console=True)
+                if res is not None:
+                    return res
         return self.coop.handle_console_command(line, players_by_pid)
 
     def tick(self, players_by_pid: dict[int, object]) -> list[tuple[tuple[str, int], bytes]]:
-        return self.coop.tick(players_by_pid)
+        return self.coop.tick(players_by_pid) + self.world.tick(players_by_pid)

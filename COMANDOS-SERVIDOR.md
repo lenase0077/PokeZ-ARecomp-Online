@@ -125,7 +125,32 @@ El servidor trae códigos precargados listos para canjear desde el menú de Myst
 
 ---
 
-## 6. Notas del servidor privado
+## 6. Mundo sincronizado (`/time`) y Carreras (`/race`)
 
-- **Persistencia**: el estado de eventos, códigos de regalo, admins, amigos, racha diaria, mochila, tickets de Raid y slots de Guardería se guarda automáticamente en `lumiose/private-room-state.json`.
+### Ciclo día/noche y spawns compartidos (`/time`)
+El servidor coordina el reloj del mundo para todos los jugadores (`15 min` reales de día y `7.5 min` reales de noche), los spawns salvajes (`wildroll`) y la sincronización de lanzamientos/capturas (`catchsync` / `capsync`).
+
+| Comando | Quién puede usarlo | Qué hace |
+|---|---|---|
+| `/time` o `/reloj` | Todos | Muestra la hora actual del mundo (`HH:MM`, Día/Noche, `AUTO`/`PAUSADO`). |
+| `/time <day\|night\|dawn\|dusk>` | Admin / Consola | Cambia la hora del mundo a día (`08:00`), noche (`20:00`), amanecer (`06:00`) o atardecer (`18:00`) para toda la sala. |
+| `/time <HH:MM>` | Admin / Consola | Fija una hora exacta (ej. `/time 14:30`). |
+| `/time pause` / `/time auto` | Admin / Consola | Pausa el avance automático del reloj o lo reanuda. |
+
+### Carrera de Pokédex e Historia (`/race`)
+Registra a los primeros 3 jugadores que completan la Pokédex base o la historia principal y envía automáticamente premios (Ability Patch, Ability Capsule, Rare Candy y dinero) a su Correo dentro del juego.
+
+| Comando | Quién puede usarlo | Qué hace |
+|---|---|---|
+| `/race` o `/carrera` | Todos | Muestra el podio actual de la Carrera de Pokédex y de Historia. |
+| `/race reset` | Admin / Consola | Reinicia los ganadores de ambas carreras para una nueva partida. |
+
+---
+
+## 7. Economía y sistemas activos del servidor
+
+- **Correo (`mail`)**: envío y recepción de mensajes, dinero, objetos y Pokémon entre jugadores (incluso si el destinatario está desconectado).
+- **Intercambio directo (`trade`)**: invitaciones, ofertas en vivo de Pokémon/objetos/dinero y transferencia completa entre dos jugadores.
+- **Intercambio Maravilla (`wonder`)**: pozo compartido donde al emparejar dos ofertas se entregan ambos Pokémon directamente por Correo.
+- **Persistencia**: el estado de eventos, reloj mundial, buzón de Correo, pozo de Wonder Trade, podios de Carreras, códigos de regalo, admins, amigos, racha diaria, mochila, tickets de Raid y slots de Guardería se guarda automáticamente en `lumiose/private-room-state.json`.
 - **Mercado de Luminalia**: se encuentra desactivado a propósito en el servidor privado para evitar confusión en salas entre pocos jugadores.

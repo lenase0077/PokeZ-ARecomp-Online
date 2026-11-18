@@ -1158,7 +1158,7 @@ class CoopHub:
         args = parts[1:]
 
         if cmd in ('help', 'ayuda', '?'):
-            msg = 'Comandos: /events | /event <nombre> <on|off> | /autoevent [now|stop|interval|duration|raid] | /gift | /charm | /tickets | /raid | /say'
+            msg = 'Comandos: /events | /event <nombre> <on|off> | /autoevent [status|now|stop] | /time [day|night|HH:MM|pause|auto] | /race [reset] | /gift | /charm | /tickets | /raid | /say'
             return ([(sender.addr, build_server_notice(sender.token, msg))] if sender else []), msg
 
         if cmd in ('events', 'eventos'):

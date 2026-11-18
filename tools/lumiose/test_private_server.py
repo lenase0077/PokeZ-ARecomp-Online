@@ -816,6 +816,242 @@ class CoopAndEventsTests(unittest.TestCase):
             self.assertFalse(srv2.extensions.coop.is_event_on('instant_hatch'))
             self.assertIsNone(srv2.extensions.coop.auto_active_event)
 
+    def test_world_clock_wildroll_and_catchsync_phase1(self):
+        import private_world as pw
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / 'private-room-state.json'
+            wall = [1794960000.0]
+            srv = ps.LumiosePrivateServer(state_path=state_file, wall_clock=lambda: wall[0])
+            addr_a = ('127.0.0.1', 40801)
+            addr_b = ('190.22.219.1', 40802)
+            pid_a, tok_a, r_a = self._join(srv, b'A' * 14, b'Leandro', addr_a)
+            pid_b, tok_b, r_b = self._join(srv, b'B' * 14, b'Amorcito', addr_b)
+
+            # Join delivers 0xB1 world clock with non-zero master_pid and cycle flags=0x03
+            clk_a = next(p for _, p in r_a if p[3] == pw.PKT_WORLD_CLOCK)
+            self.assertEqual(len(clk_a), 26)
+            master_pid, cmin, zone, flags = struct.unpack_from('<HHBB', clk_a, 8)
+            self.assertEqual(master_pid, pw.WORLD_MASTER_PID)
+            self.assertEqual(flags, 0x03)
+            self.assertEqual(zone, 0)  # default 08:00 day
+
+            # Non-admin cannot change /time; admin sets /time night -> broadcasts 0xB1 with zone=1
+            r_deny = srv.handle_packet(self._chat(tok_b, b'/time night'), addr_b, now=2.0)
+            self.assertIn(b'anfitrion', r_deny[0][1])
+            r_night = srv.handle_packet(self._chat(tok_a, b'/time night'), addr_a, now=2.1)
+            clk_b = next(p for d, p in r_night if d == addr_b and p[3] == pw.PKT_WORLD_CLOCK)
+            _, cmin_n, zone_n, _ = struct.unpack_from('<HHBB', clk_b, 8)
+            self.assertEqual((cmin_n, zone_n), (20 * 60, 1))
+
+            # /time pause + reload persistence + tick 10s broadcast
+            srv.handle_console_command('time 14:30')
+            srv.handle_console_command('time pause')
+            srv2 = ps.LumiosePrivateServer(state_path=state_file, wall_clock=lambda: wall[0])
+            cmin2, _, zone2 = srv2.extensions.world.current_clock()
+            self.assertEqual((cmin2, zone2), (14 * 60 + 30, 0))
+            wall[0] += 11.0
+            r_tick = srv.tick()
+            self.assertTrue(any(d == addr_a and p[3] == pw.PKT_WORLD_CLOCK for d, p in r_tick))
+
+            # [wildroll] 0x28 decision request -> consistent 0xFC 0x11 seed & owner_pid for both players
+            req28_a = ps.pack_header(pw.PKT_WILD_ROLL_REQ, tok_a) + struct.pack('<BII', 1, 0x12345678, 7)
+            r_wr_a = srv.handle_packet(req28_a, addr_a, now=2.2)
+            fc11_a = next(p for d, p in r_wr_a if d == addr_a and p[3] == pw.PKT_EXTENSION_OUT and p[8] == pw.SUBOP_WILDROLL_DECISIONS)
+            ph, ep, seed_a, owner_a = struct.unpack_from('<IIHB', fc11_a, 11)
+            self.assertEqual((ph, ep, owner_a), (0x12345678, 7, pid_a))
+            self.assertGreater(seed_a, 0)
+
+            req28_b = ps.pack_header(pw.PKT_WILD_ROLL_REQ, tok_b) + struct.pack('<BII', 1, 0x12345678, 7)
+            r_wr_b = srv.handle_packet(req28_b, addr_b, now=2.3)
+            fc11_b = next(p for d, p in r_wr_b if d == addr_b and p[3] == pw.PKT_EXTENSION_OUT and p[8] == pw.SUBOP_WILDROLL_DECISIONS)
+            _, _, seed_b, owner_b = struct.unpack_from('<IIHB', fc11_b, 11)
+            self.assertEqual((seed_b, owner_b), (seed_a, owner_a))
+
+            # [wildroll] state relays 0x24 -> 0xA4 (12B), 0x26 -> 0xA6 (38B), 0x27 -> 0xA7 (12B)
+            pkt24 = ps.pack_header(pw.PKT_WILD_CLAIM, tok_a) + b'\x01' + b'\xAA' * 20
+            r24 = srv.handle_packet(pkt24, addr_a, now=2.4)
+            self.assertEqual(len(r24), 1)
+            self.assertEqual(r24[0][0], addr_b)
+            self.assertEqual(r24[0][1][3], pw.PKT_WILD_CLAIM_OUT)
+            self.assertEqual(len(r24[0][1]), 9 + 12)
+            self.assertEqual(struct.unpack_from('<H', r24[0][1], 19)[0], pid_a)
+
+            pkt26 = ps.pack_header(pw.PKT_WILD_STATE, tok_b) + b'\x01' + b'\xBB' * 36
+            r26 = srv.handle_packet(pkt26, addr_b, now=2.5)
+            self.assertEqual(r26[0][0], addr_a)
+            self.assertEqual(r26[0][1][3], pw.PKT_WILD_STATE_OUT)
+            self.assertEqual(len(r26[0][1]), 9 + 38)
+            self.assertEqual(struct.unpack_from('<H', r26[0][1], 45)[0], pid_b)
+
+            # [catchsync] 0x7D 0x0E -> 0xFC 0x0B & [capsync] 0x7D 0x2B -> 0xFC 0x36
+            pkt_catch = ps.pack_header(pw.PKT_EXTENSION, tok_a) + bytes([pw.SUBOP_CATCHSYNC_IN, 0, 0, 0, 0]) + b'\x11\x22\x33\x44\x55\x66\x77\x88' + bytes([1]) + struct.pack('<H', 250)
+            r_cs = srv.handle_packet(pkt_catch, addr_a, now=2.6)
+            self.assertEqual(r_cs[0][0], addr_b)
+            self.assertEqual(r_cs[0][1][8], pw.SUBOP_CATCHSYNC_OUT)
+            self.assertEqual(len(r_cs[0][1]), 9 + 13)
+            self.assertEqual(struct.unpack_from('<H', r_cs[0][1], 9)[0], pid_a)
+
+            pkt_cap = ps.pack_header(pw.PKT_EXTENSION, tok_a) + bytes([pw.SUBOP_CAPSYNC_IN, 0, 0, 0, 0, 4, 1, 2, 1]) + struct.pack('<I', 1000) + b'\x55' * 23
+            r_cap = srv.handle_packet(pkt_cap, addr_a, now=2.7)
+            self.assertEqual(r_cap[0][0], addr_b)
+            self.assertEqual(r_cap[0][1][8], pw.SUBOP_CAPSYNC_OUT)
+            self.assertEqual(len(r_cap[0][1]), 9 + 10 + 23)
+            self.assertEqual(struct.unpack_from('<H', r_cap[0][1], 9)[0], pid_a)
+
+    def _make_fake_pk9(self, ec: int, pid: int, species: int) -> bytes:
+        import private_economy as pe
+        raw = bytearray(0x140)
+        struct.pack_into('<H', raw, 0, species)
+        struct.pack_into('<I', raw, 0x14, pid)
+        seed = ec
+        for off in range(0, len(raw), 2):
+            seed = (seed * 0x41C64E6D + 0x6073) & 0xFFFFFFFF
+            w = struct.unpack_from('<H', raw, off)[0] ^ ((seed >> 16) & 0xFFFF)
+            struct.pack_into('<H', raw, off, w)
+        return struct.pack('<IHH', ec, 0, 0x1234) + bytes(raw) + b'\x00' * (pe.PKM_BLOB_SIZE - 8 - 0x140)
+
+    def test_mail_trade_and_wonder_phase2(self):
+        import private_economy as pe
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / 'private-room-state.json'
+            wall = [1794960000.0]
+            srv = ps.LumiosePrivateServer(state_path=state_file, wall_clock=lambda: wall[0])
+            addr_a = ('127.0.0.1', 40901)
+            addr_b = ('190.22.219.1', 40902)
+            pid_a, tok_a, _ = self._join(srv, b'A' * 14, b'Leandro', addr_a)
+            pid_b, tok_b, _ = self._join(srv, b'B' * 14, b'Amorcito', addr_b)
+
+            # [mail] directory 0x5C -> 0xDD lists peer
+            r_dir = srv.handle_packet(ps.pack_header(pe.PKT_MAIL_DIR_REQ, tok_a) + struct.pack('<H', 7), addr_a, now=2.0)
+            self.assertEqual(r_dir[0][1][3], pe.PKT_MAIL_DIR_OUT)
+            self.assertEqual(r_dir[0][1][10], 1)
+            self.assertIn(b'Amorcito', r_dir[0][1])
+
+            # [mail] send 0x5A with money, item, and 344B PKM -> receipt 0xDA to sender + push 0xDC/0xD8 to receiver
+            pkm_gift = self._make_fake_pk9(0x10200000, 0xCAFEBABE, 25)
+            to_b = b'Amorcito'
+            msg_b = b'Regalo!'
+            pkt_send = (
+                ps.pack_header(pe.PKT_MAIL_SEND, tok_a)
+                + struct.pack('<HB', 11, len(to_b)) + to_b
+                + struct.pack('<B', len(msg_b)) + msg_b
+                + struct.pack('<IBHHB', 5000, 1, 50, 2, 1)
+                + struct.pack('<H', pe.PKM_BLOB_SIZE) + pkm_gift
+            )
+            r_send = srv.handle_packet(pkt_send, addr_a, now=2.1)
+            self.assertTrue(any(d == addr_a and p[3] == pe.PKT_MAIL_DETAIL_OUT and p[10] == 0 for d, p in r_send))
+            self.assertTrue(any(d == addr_b and p[3] == pe.PKT_MAIL_NOTIFY_OUT and b'Leandro' in p for d, p in r_send))
+            sum_b = next(p for d, p in r_send if d == addr_b and p[3] == pe.PKT_MAIL_SUMMARY_OUT)
+            self.assertEqual(sum_b[9], 1)  # 1 unread
+
+            # Persist across restart -> Amorcito lists (0x59->0xD9), opens (0x5B 7->0xDA), claims (0x5B 4->0xDB), deletes (0x5B 6)
+            srv2 = ps.LumiosePrivateServer(state_path=state_file, wall_clock=lambda: wall[0])
+            srv2._remove_player(pid_a, reason='test')
+            srv2._remove_player(pid_b, reason='test')
+            pid_b2, tok_b2, _ = self._join(srv2, b'B' * 14, b'Amorcito', addr_b)
+            r_list = srv2.handle_packet(ps.pack_header(pe.PKT_MAIL_LIST_REQ, tok_b2) + struct.pack('<HBH', 1, 0, 0), addr_b, now=2.2)
+            d9 = r_list[0][1]
+            self.assertEqual(d9[3], pe.PKT_MAIL_LIST_OUT)
+            self.assertEqual(d9[20], 1)
+            mail_id = struct.unpack_from('<I', d9, 21)[0]
+
+            r_open = srv2.handle_packet(ps.pack_header(pe.PKT_MAIL_ACTION, tok_b2) + struct.pack('<HBI', 2, 7, mail_id), addr_b, now=2.3)
+            da = next(p for _, p in r_open if p[3] == pe.PKT_MAIL_DETAIL_OUT)
+            self.assertEqual(da[10], 0)
+            self.assertIn(pkm_gift, da)
+
+            r_claim = srv2.handle_packet(ps.pack_header(pe.PKT_MAIL_ACTION, tok_b2) + struct.pack('<HBI', 3, 4, mail_id), addr_b, now=2.4)
+            db = next(p for _, p in r_claim if p[3] == pe.PKT_MAIL_ACK_OUT)
+            self.assertEqual(db[10], 0)
+            self.assertEqual(struct.unpack_from('<I', db, 20)[0], 5000)
+
+            # Second claim is blocked
+            r_dup = srv2.handle_packet(ps.pack_header(pe.PKT_MAIL_ACTION, tok_b2) + struct.pack('<HBI', 4, 4, mail_id), addr_b, now=2.5)
+            self.assertEqual(r_dup[0][1][10], 1)
+
+            # [trade] 0x60->0xE0 invite, 0x61->0xE1 start, 0x62->0xE2 offer, 0x63->0xE3/0xE4 commit, 0x66->0xE7 chunk, 0x65->0xE5 done
+            _, tok_a2, _ = self._join(srv2, b'A' * 14, b'Leandro', addr_a)
+            pid_a2 = srv2.extensions._find_online_by_tid(srv2.players, (b'A' * 14).hex()).pid
+            r_inv = srv2.handle_packet(ps.pack_header(pe.PKT_TRADE_INVITE, tok_a2) + struct.pack('<H', pid_b2), addr_a, now=2.6)
+            self.assertEqual((r_inv[0][0], r_inv[0][1][3], r_inv[0][1][10]), (addr_b, pe.PKT_TRADE_STATUS_OUT, 1))
+
+            r_acc = srv2.handle_packet(ps.pack_header(pe.PKT_TRADE_RESPONSE, tok_b2) + struct.pack('<HB', pid_a2, 1), addr_b, now=2.7)
+            e1_a = next(p for d, p in r_acc if d == addr_a and p[3] == pe.PKT_TRADE_START_OUT)
+            sid = struct.unpack_from('<I', e1_a, 8)[0]
+
+            slot_pkm = struct.pack('<BHHBBBB', 1, 25, 50, 0, 1, 0, 0) + bytes([7]) + b'Pikachu'
+            offer_a = ps.pack_header(pe.PKT_TRADE_OFFER, tok_a2) + struct.pack('<IHB', sid, 1, 1) + slot_pkm + struct.pack('<I', 200)
+            r_off = srv2.handle_packet(offer_a, addr_a, now=2.8)
+            self.assertTrue(any(d == addr_b and p[3] == pe.PKT_TRADE_OFFER_OUT for d, p in r_off))
+
+            # Commit from both sides -> sends 0xE4 commit plan
+            srv2.handle_packet(ps.pack_header(pe.PKT_TRADE_READY, tok_a2) + struct.pack('<IBHB', sid, 1, 1, 1), addr_a, now=2.9)
+            r_c2 = srv2.handle_packet(ps.pack_header(pe.PKT_TRADE_READY, tok_b2) + struct.pack('<IBHB', sid, 1, 0, 1), addr_b, now=3.0)
+            e4_b = next(p for d, p in r_c2 if d == addr_b and p[3] == pe.PKT_TRADE_COMMIT_OUT)
+            self.assertEqual(struct.unpack_from('<IB', e4_b, 8), (sid, 0))  # B gives 0 PKM, gets 1 PKM + 200 money
+
+            # Chunk relay 0x66 -> 0xE7 + 0x65 done cleanup
+            r_chk = srv2.handle_packet(ps.pack_header(pe.PKT_TRADE_CHUNK, tok_a2) + struct.pack('<IBHHH', sid, 0, 10, 0, 10) + b'Z' * 10, addr_a, now=3.1)
+            self.assertEqual((r_chk[0][0], r_chk[0][1][3]), (addr_b, pe.PKT_TRADE_CHUNK_OUT))
+            srv2.handle_packet(ps.pack_header(pe.PKT_TRADE_DONE, tok_a2) + struct.pack('<IB', sid, 1), addr_a, now=3.2)
+            r_done = srv2.handle_packet(ps.pack_header(pe.PKT_TRADE_DONE, tok_b2) + struct.pack('<IB', sid, 1), addr_b, now=3.3)
+            self.assertTrue(any(d == addr_a and p[3] == pe.PKT_TRADE_DONE_OUT and p[12] == 5 for d, p in r_done))
+            self.assertNotIn(sid, srv2.extensions.trade.sessions)
+
+            # [wonder] Player A deposits & settles -> enters pool; Player B deposits & settles -> pairs & mails both PKMs!
+            pkm_a = self._make_fake_pk9(0x20300000, 0x11112222, 609)
+            pkm_b = self._make_fake_pk9(0x20400000, 0x33334444, 478)
+            r_wa = srv2.handle_packet(ps.pack_header(pe.PKT_WONDER_OP, tok_a2) + struct.pack('<BBH', 1, 0, 10) + pkm_a, addr_a, now=3.4)
+            fc25_a = r_wa[0][1]
+            self.assertEqual((fc25_a[8], fc25_a[18]), (pe.SUBOP_WONDER_OUT, 1))
+            oid_a = struct.unpack_from('<I', fc25_a, 14)[0]
+            r_sa = srv2.handle_packet(ps.pack_header(pe.PKT_EXTENSION, tok_a2) + struct.pack('<BBBHBI', pe.SUBOP_WONDER_POLL_SETTLE, 0, 0, 11, 2, oid_a), addr_a, now=3.5)
+            self.assertIn(b'Wonder Pool', r_sa[0][1])
+
+            r_wb = srv2.handle_packet(ps.pack_header(pe.PKT_WONDER_OP, tok_b2) + struct.pack('<BBH', 1, 0, 12) + pkm_b, addr_b, now=3.6)
+            oid_b = struct.unpack_from('<I', r_wb[0][1], 14)[0]
+            r_sb = srv2.handle_packet(ps.pack_header(pe.PKT_EXTENSION, tok_b2) + struct.pack('<BBBHBI', pe.SUBOP_WONDER_POLL_SETTLE, 0, 0, 13, 2, oid_b), addr_b, now=3.7)
+            self.assertTrue(any(d == addr_b and p[3] == pe.PKT_EXTENSION_OUT and b'Check your Mail' in p for d, p in r_sb))
+            self.assertTrue(any(d == addr_a and p[3] == pe.PKT_MAIL_NOTIFY_OUT and b'Wonder Trade' in p for d, p in r_sb))
+            self.assertEqual(len(srv2.extensions.wonder.pool), 0)
+
+    def test_dexrace_and_story_race_with_mail_prizes_phase3(self):
+        import private_economy as pe
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / 'private-room-state.json'
+            wall = [1794960000.0]
+            srv = ps.LumiosePrivateServer(state_path=state_file, wall_clock=lambda: wall[0])
+            addr_a = ('127.0.0.1', 41001)
+            addr_b = ('190.22.219.1', 41002)
+            _, tok_a, _ = self._join(srv, b'A' * 14, b'Leandro', addr_a)
+            _, tok_b, _ = self._join(srv, b'B' * 14, b'Amorcito', addr_b)
+
+            # [dexrace] A completes #1 -> 0xFC 0x37 place=1 + 0xFC 0x2C broadcast + prize mail in inbox
+            r_da = srv.handle_packet(ps.pack_header(pe.PKT_EXTENSION, tok_a) + struct.pack('<BHHBH', pe.SUBOP_DEXRACE_IN, 0, 0, 2, 230), addr_a, now=2.0)
+            fc37 = next(p for d, p in r_da if d == addr_a and p[3] == pe.PKT_EXTENSION_OUT and p[8] == pe.SUBOP_DEXRACE_CONGRATS_OUT)
+            self.assertEqual(fc37[12], 1)  # place 1
+            self.assertTrue(any(d == addr_a and p[3] == pe.PKT_MAIL_NOTIFY_OUT and b'Pokedex Race' in p for d, p in r_da))
+            self.assertTrue(any(d == addr_b and p[3] == pe.PKT_EXTENSION_OUT and p[8] == pe.SUBOP_DEXRACE_BOARD_OUT for d, p in r_da))
+
+            # [story] B finishes #1 -> 0xFC 0x09 podium place=1 + Story Race prize mail
+            r_sb = srv.handle_packet(ps.pack_header(pe.PKT_STORY_REPORT, tok_b) + struct.pack('<IBB', 0x8000, 1, 1), addr_b, now=2.1)
+            fc09 = next(p for d, p in r_sb if d == addr_b and p[3] == pe.PKT_EXTENSION_OUT and p[8] == pe.SUBOP_STORY_PODIUM_OUT)
+            self.assertEqual(fc09[9], 1)  # 1 winner
+            self.assertEqual(fc09[-2], 1)  # my_place = 1
+            self.assertTrue(any(d == addr_b and p[3] == pe.PKT_MAIL_NOTIFY_OUT and b'Story Race' in p for d, p in r_sb))
+
+            # /race status + persistence + /race reset
+            r_cmd = srv.handle_packet(self._chat(tok_a, b'/race'), addr_a, now=2.2)
+            self.assertIn(b'#1 Leandro(230)', r_cmd[0][1])
+            self.assertIn(b'#1 Amorcito', r_cmd[0][1])
+
+            srv2 = ps.LumiosePrivateServer(state_path=state_file, wall_clock=lambda: wall[0])
+            self.assertEqual(len(srv2.extensions.race.dex_winners), 1)
+            self.assertEqual(len(srv2.extensions.race.story_winners), 1)
+            srv2.handle_console_command('race reset')
+            self.assertEqual(len(srv2.extensions.race.dex_winners), 0)
+            self.assertEqual(len(srv2.extensions.race.story_winners), 0)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -651,17 +651,36 @@ class CoopAndEventsTests(unittest.TestCase):
         srv = ps.LumiosePrivateServer(wall_clock=lambda: 1794960000.0)
         addr_a = ('127.0.0.1', 40501)
         addr_b = ('190.22.219.1', 40502)
-        _, tok_a, _ = self._join(srv, b'R' * 14, b'Leandro', addr_a)
+        _, tok_a, join_a = self._join(srv, b'R' * 14, b'Leandro', addr_a)
         _, tok_b, _ = self._join(srv, b'S' * 14, b'Amorcito', addr_b)
+
+        # Joining never sends action=2 (would pop up fake $250,000 purchase dialog!)
+        join_tkt = [p for _, p in join_a if p[3] == pf.PKT_EXTENSION_IN and p[8] == pc.RX_SUBOP_RAID_TICKET]
+        self.assertEqual(len(join_tkt), 1)
+        self.assertEqual((join_tkt[0][12], join_tkt[0][13], join_tkt[0][14]), (1, 0, 1))
 
         # Toggle double_loot on via chat command
         srv.handle_packet(self._chat(tok_a, b'/event double_loot on'), addr_a, now=2.0)
 
-        # Buy Raid Ticket (0x7D 0x29) -> increments ticket count
-        buy_pkt = ps.pack_header(pf.PKT_EXTENSION, tok_a) + struct.pack('<BBBHBBB', pc.TX_SUBOP_RAID_TICKET, 0, 0, 11, 1, 1, 0)
-        r_buy = srv.handle_packet(buy_pkt, addr_a, now=2.1)
-        tkt_pkt = next(p for _, p in r_buy if p[3] == pf.PKT_EXTENSION_IN and p[8] == pc.RX_SUBOP_RAID_TICKET and p[12] == 1)
-        self.assertEqual(tkt_pkt[14], 2)  # started with 1, now 2
+        # Buy Raid Ticket 2-step flow:
+        # Step 1 (0x7D 0x29 action=1) -> server sends action=2 once with cost=250000
+        buy_ask = ps.pack_header(pf.PKT_EXTENSION, tok_a) + struct.pack('<BBBHBBB', pc.TX_SUBOP_RAID_TICKET, 0, 0, 11, 1, 1, 1)
+        r_ask = srv.handle_packet(buy_ask, addr_a, now=2.1)
+        self.assertEqual(len(r_ask), 1)
+        self.assertEqual((r_ask[0][1][12], r_ask[0][1][13]), (2, 0))
+        self.assertEqual(struct.unpack_from('<Q', r_ask[0][1], 20)[0] >> 32, 250000)
+
+        # Step 2 (0x7D 0x29 action=2 ok=0) -> insufficient money does not increment and does not re-send action=2
+        buy_fail = ps.pack_header(pf.PKT_EXTENSION, tok_a) + struct.pack('<BBBHBBB3xB', pc.TX_SUBOP_RAID_TICKET, 0, 0, 11, 1, 2, 0, 0)
+        r_fail = srv.handle_packet(buy_fail, addr_a, now=2.12)
+        self.assertEqual((r_fail[0][1][12], r_fail[0][1][14]), (1, 1))
+
+        # Step 2 (0x7D 0x29 action=2 ok=1) -> increments ticket count silently (action=1) without action=2 loop
+        buy_commit = ps.pack_header(pf.PKT_EXTENSION, tok_a) + struct.pack('<BBBHBBB3xB', pc.TX_SUBOP_RAID_TICKET, 0, 0, 11, 1, 2, 0, 1)
+        r_buy = srv.handle_packet(buy_commit, addr_a, now=2.15)
+        self.assertEqual(len(r_buy), 1)
+        tkt_pkt = r_buy[0][1]
+        self.assertEqual((tkt_pkt[12], tkt_pkt[13], tkt_pkt[14]), (1, 0, 2))  # started with 1, now 2
 
         # Start raid (0x7D 0x1D act=4) -> spawns Boss for both A and B (0xFC 0x2E msg_type=5 & 1)
         start_pkt = ps.pack_header(pf.PKT_EXTENSION, tok_a) + struct.pack('<BBBHB', pc.TX_SUBOP_RAID_LOBBY, 0, 0, 12, 4)
@@ -679,10 +698,10 @@ class CoopAndEventsTests(unittest.TestCase):
         self.assertEqual(end_b[16], 2)  # double reward=2
         self.assertTrue(any(d == addr_b and p[3] == pf.PKT_EXTENSION_IN and p[8] == pf.SUBOP_LUMIOSE_BAG for d, p in r_hit))
 
-        # Turning raids off pushes disabled flag in 0xFC 0x31
+        # Turning raids off pushes disabled status=6 in silent action=1 0xFC 0x31 (never action=2)
         r_off = srv.handle_packet(self._chat(tok_a, b'/event raids off'), addr_a, now=2.4)
-        off_b = next(p for d, p in r_off if d == addr_b and p[3] == pf.PKT_EXTENSION_IN and p[8] == pc.RX_SUBOP_RAID_TICKET and p[12] == 2)
-        self.assertEqual(off_b[13], 0)
+        off_b = next(p for d, p in r_off if d == addr_b and p[3] == pf.PKT_EXTENSION_IN and p[8] == pc.RX_SUBOP_RAID_TICKET)
+        self.assertEqual((off_b[12], off_b[13]), (1, 6))
 
     def test_nursery_eggs_upload_claim_and_instant_hatch(self):
         with tempfile.TemporaryDirectory() as tmp:

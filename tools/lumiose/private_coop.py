@@ -326,10 +326,10 @@ class CoopHub:
     # --- Join / Leave lifecycle ---
     def on_player_join(self, player, players_by_pid: dict[int, object]) -> list[tuple[tuple[str, int], bytes]]:
         rec = self._ensure_record(player.trainer_id, player.name)
+        ticket_status = 0 if self.is_event_on('raids') else 6
         out: list[tuple[tuple[str, int], bytes]] = [
             (player.addr, self.build_settings_packet(player.token)),
-            (player.addr, self.build_raid_ticket_packet(player.token, 0, action=1, status=0, tickets=rec.raid_tickets)),
-            (player.addr, self.build_raid_ticket_packet(player.token, 0, action=2, status=1 if self.is_event_on('raids') else 0, tickets=rec.raid_tickets)),
+            (player.addr, self.build_raid_ticket_packet(player.token, 0, action=1, status=ticket_status, tickets=rec.raid_tickets)),
         ]
         # Keep existing party roster fresh if player reconnected on same pid
         pid_num = self.player_party.get(player.pid)
@@ -599,8 +599,19 @@ class CoopHub:
         return []
 
     # --- Co-op Raids (0x7D 0x1D / 0x26 / 0x29 <-> 0xFC 0x21 / 0x22 / 0x2E / 0x31 / 0x33) ---
-    def build_raid_ticket_packet(self, token: int, req_id: int, *, action: int, status: int, tickets: int, raid_val: int = 0) -> bytes:
+    def build_raid_ticket_packet(
+        self,
+        token: int,
+        req_id: int,
+        *,
+        action: int,
+        status: int,
+        tickets: int,
+        raid_val: int = 0,
+        w8: int | None = None,
+    ) -> bytes:
         # 23 bytes after subop: ver(1), req_id(2), action(1), status(1), tickets(1), pad(5), d31(8), w8(4)
+        extra = (1 if self.is_event_on('raids') else 0) if w8 is None else w8
         return _pack_hdr(0xFC, token) + struct.pack(
             '<BBHBBB5xQI',
             RX_SUBOP_RAID_TICKET,
@@ -610,7 +621,7 @@ class CoopHub:
             status & 0xFF,
             tickets & 0xFF,
             raid_val & 0xFFFFFFFFFFFFFFFF,
-            1 if self.is_event_on('raids') else 0,
+            extra & 0xFFFFFFFF,
         )
 
     def build_raid_spots_packet(self, token: int, boss: RaidSession | None) -> bytes:
@@ -738,14 +749,24 @@ class CoopHub:
         action = pkt[14]
         rec = self._ensure_record(player.trainer_id, player.name)
         if not self.is_event_on('raids'):
-            return [(player.addr, self.build_raid_ticket_packet(player.token, req_id, action=2, status=0, tickets=rec.raid_tickets))]
-        if action in (1, 2) and rec.raid_tickets < MAX_RAID_TICKETS:
-            rec.raid_tickets += 1
-            self._save()
-        return [
-            (player.addr, self.build_raid_ticket_packet(player.token, req_id, action=1, status=0, tickets=rec.raid_tickets)),
-            (player.addr, self.build_raid_ticket_packet(player.token, req_id, action=2, status=1, tickets=rec.raid_tickets)),
-        ]
+            return [(player.addr, self.build_raid_ticket_packet(player.token, req_id, action=1, status=6, tickets=rec.raid_tickets))]
+
+        # Step 1: UI asks to buy 1 ticket -> server sends action=2 ONCE so client debits $250,000 in save.
+        if action == 1:
+            if rec.raid_tickets >= MAX_RAID_TICKETS:
+                return [(player.addr, self.build_raid_ticket_packet(player.token, req_id, action=1, status=2, tickets=rec.raid_tickets))]
+            raid_val = (250000 << 32) | ((req_id or 1) & 0xFFFFFFFF)
+            return [(player.addr, self.build_raid_ticket_packet(player.token, req_id, action=2, status=0, tickets=rec.raid_tickets, raid_val=raid_val, w8=0xFFFFFFFF))]
+
+        # Step 2: client reports save-money debit result (len=20, pkt[19]==1 on success) -> silent action=1 sync.
+        if action == 2:
+            debit_ok = len(pkt) >= 20 and pkt[19] != 0
+            if debit_ok and rec.raid_tickets < MAX_RAID_TICKETS:
+                rec.raid_tickets += 1
+                self._save()
+            return [(player.addr, self.build_raid_ticket_packet(player.token, req_id, action=1, status=0, tickets=rec.raid_tickets))]
+
+        return [(player.addr, self.build_raid_ticket_packet(player.token, req_id, action=1, status=0, tickets=rec.raid_tickets))]
 
     def _handle_raid_lobby(self, pkt: bytes, player, players_by_pid: dict[int, object]) -> list[tuple[tuple[str, int], bytes]]:
         if len(pkt) < 14:
@@ -753,9 +774,10 @@ class CoopHub:
         req_id = struct.unpack_from('<H', pkt, 11)[0]
         action = pkt[13]
         if not self.is_event_on('raids'):
+            rec = self._ensure_record(player.trainer_id, player.name)
             return [
                 (player.addr, self.build_raid_ack_packet(player.token, req_id, 0)),
-                (player.addr, self.build_raid_ticket_packet(player.token, 0, action=2, status=0, tickets=0)),
+                (player.addr, self.build_raid_ticket_packet(player.token, 0, action=1, status=6, tickets=rec.raid_tickets)),
             ]
 
         out: list[tuple[tuple[str, int], bytes]] = [(player.addr, self.build_raid_ack_packet(player.token, req_id, 1))]
@@ -1017,7 +1039,8 @@ class CoopHub:
             out.append((p.addr, self.build_settings_packet(p.token)))
             out.append((p.addr, build_server_notice(p.token, notice)))
             if ev_key == 'raids':
-                out.append((p.addr, self.build_raid_ticket_packet(p.token, 0, action=2, status=1 if enabled else 0, tickets=rec.raid_tickets)))
+                t_status = 0 if enabled else 6
+                out.append((p.addr, self.build_raid_ticket_packet(p.token, 0, action=1, status=t_status, tickets=rec.raid_tickets)))
             if ev_key == 'shiny_event' and enabled:
                 rec.bag['1'] = min(99, rec.bag.get('1', 0) + 1)
                 out.append((p.addr, self._build_bag_packet(p.token, rec)))

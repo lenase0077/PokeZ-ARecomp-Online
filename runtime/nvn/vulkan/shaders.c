@@ -116,8 +116,11 @@ static uint32_t *no_contraction(uint32_t *spv, size_t *nwords) {
 // No spirv-opt by default: it rewrote the depth pre-pass and colour-pass vertex shaders differently enough that
 // their depths stopped matching (EQUAL test: black holes in foliage), and it was most of the compile time; the
 // driver optimises anyway. LARECOMP_VK_OPT=1 turns it back on (experiments).
+// (exec.c's compute sweep, #315) this thread's next compiles with the SPIR-V optimizer (LARECOMP_VK_OPT for all)
+__thread int vk_spirv_opt_perf;
 uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords) {
     uint64_t h = src_hash(src, stage);
+    if (vk_spirv_opt_perf) h = (h ^ 0x9E3779B97F4A7C15ull) * 0x100000001B3ull;  // (its own cache entry)
     static int nocache = -1;
     if (nocache < 0) nocache = ENV("LARECOMP_VK_NO_SPIRV_CACHE") != NULL;
     uint32_t *out = nocache ? NULL : cache_load(h, nwords);
@@ -127,7 +130,7 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
     shaderc_compile_options_t o = shaderc_compile_options_initialize();
     shaderc_compile_options_set_target_env(o, shaderc_target_env_vulkan,  // (SPIR-V 1.6 / 1.5: compat.c)
                                            g_vkc.api >= VK_API_VERSION_1_3 ? shaderc_env_version_vulkan_1_3 : shaderc_env_version_vulkan_1_2);
-    shaderc_compile_options_set_optimization_level(o, ENV("LARECOMP_VK_OPT") ? shaderc_optimization_level_performance
+    shaderc_compile_options_set_optimization_level(o, ENV("LARECOMP_VK_OPT") || vk_spirv_opt_perf ? shaderc_optimization_level_performance
                                                                                   : shaderc_optimization_level_zero);
     shaderc_compilation_result_t r = shaderc_compile_into_spv(comp, src, strlen(src), kind_of(stage), name, "main", o);
     shaderc_compile_options_release(o);
@@ -1060,13 +1063,14 @@ static const char *builtin_src(const char *name, int *stage) {
                 "  mat4 vp = inverse(mat4(pc.m0, pc.m1, pc.m2, pc.m3));\n"
                 "  vec3 P = wpos(uv, dn);\n"
                 // (window panes are drawn just like water, and being upright they'd be all mirror to the straight-up normal
-                // below: only what faces up or down gets a reflection. Each axis takes its nearer neighbour, so an edge
-                // doesn't tilt it)
+                // below: only what is level gets a reflection - within about 11 degrees, as Z-A's water is: a car's
+                // windshield, laid back 25-40 degrees, passed the old 45 and mirrored the street, #333. Each axis takes its
+                // nearer neighbour, so an edge doesn't tilt it)
                 "  vec2 px = 1.0 / pc.sz.zw, ex = vec2(px.x, 0.0), ey = vec2(0.0, px.y);\n"
                 "  vec3 Xa = P - wpos(uv - ex, depth_at(t0, uv - ex)), Xb = wpos(uv + ex, depth_at(t0, uv + ex)) - P;\n"
                 "  vec3 Ya = P - wpos(uv - ey, depth_at(t0, uv - ey)), Yb = wpos(uv + ey, depth_at(t0, uv + ey)) - P;\n"
                 "  vec3 Ng = cross(length(Xa) < length(Xb) ? Xa : Xb, length(Ya) < length(Yb) ? Ya : Yb);\n"
-                "  if (abs(Ng.y) < 0.7 * length(Ng)) discard;\n"
+                "  if (abs(Ng.y) < 0.98 * length(Ng)) discard;\n"
                 "  vec3 V = normalize(pc.cam.xyz - P);\n"
                 // (Z-A's water is level: straight up - the depth's own slope left thin lines at its triangles' seams -
                 // tilted by gentle moving ripples, prm.w the time)
